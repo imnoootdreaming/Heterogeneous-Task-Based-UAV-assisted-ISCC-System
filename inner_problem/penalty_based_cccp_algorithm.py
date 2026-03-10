@@ -15,13 +15,14 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings('error', category=RuntimeWarning)  # 把 RuntimeWarning 当作异常处理
 GRID_COLOR = '#E0E0E0'  # 柔和的网格线颜色
 
-def get_args():
-    base_parser = argparse.Argumentbase_parser(description="场景的基本参数")
+def get_base_args():
+    base_parser = argparse.ArgumentParser(description="场景的基本参数")
 
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
     base_parser.add_argument("--targets_num", type=int, default=8, help="目标数量")
+    base_parser.add_argument("--uavs_num", type=int, default=8, help="UAV 数量")
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
     base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
@@ -29,16 +30,16 @@ def get_args():
     # 信道参数
     base_parser.add_argument("--ref_path_loss_db", type=float, default=-30, help="1m 参考路径损耗 (dB)")
     base_parser.add_argument("--frac_d_lambda", type=float, default=0.5, help="天线间距与波长比例")
-    base_parser.add_argument("--alpha_uav_link", type=float, default=2.5, help="UAV 链路路径损耗指数")
+    base_parser.add_argument("--alpha_uav_link", type=float, default=2, help="UAV 链路路径损耗指数")
     base_parser.add_argument("--alpha_cu_link", type=float, default=2.5, help="CU 链路路径损耗指数")
     base_parser.add_argument("--rician_factor_db", type=float, default=10, help="Rician 因子 (dB)")
-    base_parser.add_argument("--antennas_nums", type=int, default=8, help="UAV 天线数量")
+    base_parser.add_argument("--antenna_nums", type=int, default=8, help="UAV 天线数量")
     base_parser.add_argument("--radar_rcs", type=float, default=10, help="雷达 RCS (m^2)")
     base_parser.add_argument("--noise_power_density_dbm", type=float, default=-174, help="噪声功率谱密度 (dBm/Hz)")
     base_parser.add_argument("--bandwidth", type=float, default=10e6, help="带宽 (Hz)")
 
     # 算法/物理参数
-    base_parser.add_argument("--uav_c1", type=float, default=0.00614, help="UAV 飞行参数 c1")
+    base_parser.add_argument("--uav_c1", type=float, default=0.0661, help="UAV 飞行参数 c1")
     base_parser.add_argument("--uav_c2", type=float, default=15.976, help="UAV 飞行参数 c2")
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
     base_parser.add_argument("--bs_max_freq", type=float, default=10e9, help="BS 最大工作频率 (Hz)")
@@ -47,7 +48,12 @@ def get_args():
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
     base_parser.add_argument("--cu_max_power_dbm", type=float, default=23, help="CU 最大发射功率 (dBm)")
     base_parser.add_argument("--uav_max_power", type=float, default=1.0, help="UAV 最大功率 (W)")
-    
+    base_parser.add_argument("--cu_max_delay", type=float, default=0.5, help="娱乐任务最大延迟 (s)")
+    base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
+    base_parser.add_argument("--uav_max_speed", type=float, default=40.0, help="UAV 最大移动速度 (m/s)")
+    base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
+    base_parser.add_argument("--sen_sinr", type=float, default=10, help="感知门限阈值 (dB)")
+
     # 权重参数
     base_parser.add_argument("--omega_weight_1", type=float, default=0.2, help="BS 权重")
     base_parser.add_argument("--omega_weight_2", type=float, default=0.4, help="UAV 权重")
@@ -58,6 +64,12 @@ def get_args():
     base_parser.add_argument("--var_range_fluctuation", type=float, default=1e-14, help="范围波动过程方差")
     base_parser.add_argument("--radar_impulse_duration", type=float, default=2e-5, help="雷达脉冲持续时间")
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
+
+    # 基于惩罚的 CCCP 算法参数
+    base_parser.add_argument("--max_iterations", type=int, default=30, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--cccp_threshold", type=float, default=1e-5, help="CCCP 算法收敛阈值")
+    base_parser.add_argument("--penalty_factor", type=float, default=1e-1, help="罚因子")
+    base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
 
     return base_parser.parse_args()
 
@@ -74,8 +86,8 @@ def compute_largest_eigenvector(matrix):
     eigenvalues, eigenvectors = np.linalg.eigh(matrix)
     # eigh 返回特征值升序排列，取最后一个
     v_max = eigenvectors[:, -1]
-    # 返回 v * v^T (秩一矩阵)
-    return np.outer(v_max, v_max)
+    # 返回最大特征值对应的特征向量
+    return v_max
 
 
 def generate_pos(uavs_num, cus_num, targets_num, center, radius, uav_height):
@@ -117,7 +129,7 @@ def generate_pos(uavs_num, cus_num, targets_num, center, radius, uav_height):
     return uavs_pos, cus_pos, targets_pos
 
 
-def compute_com_channel_gain(uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, alpha_uav_link, alpha_cu_link, rician_factor, antennas_nums):
+def compute_com_channel_gain(uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, alpha_uav_link, alpha_cu_link, rician_factor, antenna_nums):
     """
     UAVs, CUs 和 BS 之间的均建模为莱斯路径损耗模型
     根据莱斯路径损耗模型计算 UAVs、CUs 和 BS 之间的通信信道增益
@@ -129,7 +141,7 @@ def compute_com_channel_gain(uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, al
     :param alpha_uav_link: 与 UAV 有关链路的路径损耗系数
     :param alpha_cu_link: 与 CU 有关的路径损耗系数
     :param rician_factor: Rician 因子
-    :param antennas_nums: 天线数量 N
+    :param antenna_nums: 天线数量 N
     :return: UAVs -> CUs 信道 (I * J * N), UAVs -> BS 信道 (I * 1 * N), CUs -> BS 信道 (J * 1)
     """
     bs_pos = np.array([0, 0, 0])  # 假设 BS 位于原点
@@ -151,15 +163,15 @@ def compute_com_channel_gain(uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, al
             phi = np.arctan2(dy, dx)
             
             # LoS 分量 (Array Response Vector)
-            # h_los shape: (N_pos1, N_pos2, antennas_nums)
+            # h_los shape: (N_pos1, N_pos2, antenna_nums)
             # array_response: [1, exp(j*2*pi*d/lambda*sin(phi)), ..., exp(j*2*pi*d/lambda*(N-1)*sin(phi))]
-            n_range = np.arange(antennas_nums)
+            n_range = np.arange(antenna_nums)
             exponent = 1j * 2 * np.pi * frac_d_lambda * np.sin(phi)[..., np.newaxis] * n_range
             h_los = np.exp(exponent)
             
             # NLoS 分量 (Rayleigh)
-            # h_nlos shape: (N_pos1, N_pos2, antennas_nums)
-            h_nlos = (np.random.randn(*dist.shape, antennas_nums) + 1j * np.random.randn(*dist.shape, antennas_nums)) / np.sqrt(2)
+            # h_nlos shape: (N_pos1, N_pos2, antenna_nums)
+            h_nlos = (np.random.randn(*dist.shape, antenna_nums) + 1j * np.random.randn(*dist.shape, antenna_nums)) / np.sqrt(2)
             
             # 扩展 path_loss 维度以匹配 MIMO 信道
             path_loss_expanded = path_loss[..., np.newaxis]
@@ -190,7 +202,7 @@ def compute_com_channel_gain(uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, al
     return uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels
 
 
-def compute_sen_channel_gain(radar_rcs, frac_d_lambda, uavs_pos, targets_pos, antennas_nums, ref_path_loss):
+def compute_sen_channel_gain(radar_rcs, frac_d_lambda, uavs_pos, targets_pos, antenna_nums, ref_path_loss):
     """
     根据雷达截面积、天线间距与波长的比例，UAVs 的位置和 targets 的位置计算 UAVs 与 targets 之间的信道响应矩阵
 
@@ -198,7 +210,7 @@ def compute_sen_channel_gain(radar_rcs, frac_d_lambda, uavs_pos, targets_pos, an
     :param frac_d_lambda: 天线间距与波长的比例
     :param uavs_pos: UAVs 的位置 (I * 3)
     :param targets_pos: targets 的位置 (J * 3)
-    :param antennas_nums: 天线数量 N
+    :param antenna_nums: 天线数量 N
     :param ref_path_loss: 1m 参考距离下的路径损耗
     :return: UAVs 与 targets 之间的信道响应矩阵 A (I * J * N * N)
     """
@@ -214,7 +226,7 @@ def compute_sen_channel_gain(radar_rcs, frac_d_lambda, uavs_pos, targets_pos, an
     
     # 生成转向矢量 a_t 和 a_r (假设收发共址，角度相同)
     # n_range: (N,)
-    n_range = np.arange(antennas_nums)
+    n_range = np.arange(antenna_nums)
     # exponent: (I, J, N)
     exponent = 1j * 2 * np.pi * frac_d_lambda * np.sin(theta)[..., np.newaxis] * n_range
     # a_vec: (I, J, N)
@@ -320,37 +332,632 @@ def extract_matched_sensing_channel(uavs_targets_matched_matrix, uavs_2_targets_
     
     return matched_uav_sensing_channel
 
-def penalty_based_cccp(args, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, matched_uav_sensing_channel):
-    B = args.bandwidth
-    noise_power = dbm_2_watt(args.noise_power_density_dbm) * B
+
+def compute_uav_pos_cur(args, uavs_pos_pre):
+    """
+    根据前一时刻位置和当前时刻速度计算当前时刻位置
+
+    :param uav_pos_pre: UAVs 前一时刻位置 (I * 3)
+    :return: UAVs 当前时刻位置 (I * 3)
+    """
+    # 根据速度约束生成当前位置
+    # 随机生成速度向量，模长在 [min_speed, max_speed] 之间
+    # 速度向量 v = [vx, vy, vz], |v| = speed
+    # q(t+1) = q(t) + v * tau
     
-    # 提取参数
-    c1 = args.uav_c1
-    c2 = args.uav_c2
-    kappa = args.kappa
-    bs_max_frequency = args.bs_max_freq
-    bs_1bit_cpu_cycle = args.bs_cycles_per_bit
+    # 1. 随机生成速度大小 (I,)
+    uav_speed_magnitude = np.random.uniform(args.uav_min_speed, args.uav_max_speed, args.uavs_num)
     
-    time_slot_duration = args.time_slot_duration
-    uav_sen_duration = args.uav_sen_duration
-    cu_max_delay = time_slot_duration
-    uav_max_delay = cu_max_delay - uav_sen_duration
+    # 2. 随机生成速度方向 (I, 3) - 单位向量
+    random_direction = np.random.randn(args.uavs_num, 3)
+    random_direction /= np.linalg.norm(random_direction, axis=1, keepdims=True)
     
-    cu_max_power = dbm_2_watt(args.cu_max_power_dbm)
-    uav_max_power = args.uav_max_power
+    # 3. 计算位移向量 (I, 3)
+    # displacement = speed * direction * time
+    displacement = random_direction * uav_speed_magnitude[:, np.newaxis] * args.time_slot_duration
     
-    cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
-    
+    # 4. 更新位置
+    uavs_pos_cur = uavs_pos_pre + displacement
+    return uavs_pos_cur
+
+
+def initialize_uav_beams(args, matched_uav_sensing_channel, uavs_2_bs_channels):
+    hat_uav_sen_beams = []
+    hat_uav_off_beams = []
+
+    # ==============================
+    # 初始化 UAV 感知波束
+    # ==============================
+    for i in range(args.uavs_num):
+        H_i = matched_uav_sensing_channel[i]  # (N,N)
+
+        w_init = compute_largest_eigenvector(H_i)
+
+        W_init = np.outer(w_init, np.conj(w_init))
+
+        W_init = args.uav_max_power * W_init / np.trace(W_init)
+
+        hat_uav_sen_beams.append(W_init)
+
+    # ==============================
+    # 初始化 UAV 卸载感知任务波束
+    # ==============================
+    for i in range(args.uavs_num):
+        h_i = uavs_2_bs_channels[i, 0, :]  # (N,)
+
+        H_i = np.outer(h_i, np.conj(h_i))
+
+        w_init = compute_largest_eigenvector(H_i)
+
+        W_init = np.outer(w_init, np.conj(w_init))
+
+        W_init = args.uav_max_power * W_init / np.trace(W_init)
+
+        hat_uav_off_beams.append(W_init)
+
+    return hat_uav_sen_beams, hat_uav_off_beams
+
+
+def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs, var_auxiliary_variable_z, var_cus_off_duration,
+                    hat_auxiliary_variable_z, hat_bs_2_uav_freqs, hat_uav_sen_beams, hat_uav_off_beams, cus_entertaining_task_size,
+                    uavs_off_duration, cus_off_power, uavs_pos_pre, uavs_pos_cur, cur_penalty_factor):
+
+    obj_fun = 0
+
     omega_weight_1 = args.omega_weight_1
     omega_weight_2 = args.omega_weight_2
     omega_weight_3 = args.omega_weight_3
+    kappa = args.kappa
+
+    cu_max_delay = args.cu_max_delay
+
+    # ==============================
+    # UAV 飞行能耗
+    # ==============================
+    uavs_pos_cur = np.array(uavs_pos_cur, dtype=float)
+    uavs_pos_pre = np.array(uavs_pos_pre, dtype=float)
+    # 1. 按行求范数，得到 shape 为 (args.uavs_num,) 的距离数组
+    uav_dist_diff = np.linalg.norm(uavs_pos_cur - uavs_pos_pre, axis=1)
+    # 2. 引入极小值 epsilon 防止悬停时除以 0
+    epsilon = 1e-8
+    uav_dist_diff = np.maximum(uav_dist_diff, epsilon)
+    uav_fly_energy = (args.uav_c1 * (uav_dist_diff ** 3) / (args.time_slot_duration ** 2) +
+                      args.uav_c2 * (args.time_slot_duration ** 2) / uav_dist_diff)
+
+    # ==============================
+    # 第一项
+    # ==============================
+    for i in range(args.uavs_num):
+
+        obj_fun += omega_weight_1 * kappa * (
+            args.bs_cycles_per_bit *
+            args.uav_sen_duration *
+            cp.square(
+                var_auxiliary_variable_z[i] +
+                cp.square(var_bs_2_uav_freqs[i])  # 这里 Claude 说 cp.square(cp.square)
+            )
+        ) / 2
+
+    # ==============================
+    # 第二项
+    # ==============================
+    for j in range(args.cus_num):
+        obj_fun += omega_weight_1 * kappa * ((args.bs_cycles_per_bit * cus_entertaining_task_size[j]) ** 3) * \
+                   cp.power(cu_max_delay - var_cus_off_duration[j], -2)
+
+    # ==============================
+    # 第三项
+    # ==============================
+    for i in range(args.uavs_num):
+
+        obj_fun += omega_weight_2 * (
+            args.uav_sen_duration *
+            cp.trace(var_uavs_sen_beam[i])
+            + uavs_off_duration[i] *
+            cp.trace(var_uavs_off_beam[i])
+            + uav_fly_energy[i]
+        )
+
+    # ==============================
+    # 第四项
+    # ==============================
+    for j in range(args.cus_num):
+
+        obj_fun += omega_weight_3 * (
+            var_cus_off_duration[j] *
+            cus_off_power[j]
+        )
+
+    # ==============================
+    # 第五项 CCCP 线性化
+    # ==============================
+    for i in range(args.uavs_num):
+
+        obj_fun -= omega_weight_1 * kappa * (
+
+            args.bs_cycles_per_bit *
+            args.uav_sen_duration *
+            (hat_auxiliary_variable_z[i] ** 2) / 2
+
+            + args.bs_cycles_per_bit *
+            args.uav_sen_duration *
+            (hat_bs_2_uav_freqs[i] ** 4) / 2
+
+            + args.bs_cycles_per_bit *
+            args.uav_sen_duration *
+            hat_auxiliary_variable_z[i] *
+            (var_auxiliary_variable_z[i] -
+             hat_auxiliary_variable_z[i])
+
+            + 2 *
+            args.bs_cycles_per_bit *
+            args.uav_sen_duration *
+            (hat_bs_2_uav_freqs[i] ** 3) *
+            (var_bs_2_uav_freqs[i] -
+             hat_bs_2_uav_freqs[i])
+        )
+
+    # ==============================
+    # 第六项 rank-1 penalty
+    # ==============================
+    for i in range(args.uavs_num):
+        # 计算感知波束最大特征值对应的特征向量
+        v_w = compute_largest_eigenvector(hat_uav_sen_beams[i])
+        # 计算卸载波束最大特征值对应的特征向量
+        v_b = compute_largest_eigenvector(hat_uav_off_beams[i])
+        v_w_matrix = np.outer(v_w, np.conj(v_w))
+        v_b_matrix = np.outer(v_b, np.conj(v_b))
+
+        obj_fun += cur_penalty_factor * (
+
+            cp.real(cp.trace(var_uavs_sen_beam[i]))
+            - np.linalg.norm(hat_uav_sen_beams[i], 2)
+
+            + cp.real(cp.trace(var_uavs_off_beam[i]))
+            - np.linalg.norm(hat_uav_off_beams[i], 2)
+
+            - cp.real(cp.trace(v_w_matrix
+                               @ (var_uavs_sen_beam[i] - hat_uav_sen_beams[i])
+            ))
+
+            - cp.real(cp.trace(v_b_matrix
+                               @ (var_uavs_off_beam[i] -  hat_uav_off_beams[i])
+                               )
+                      )
+        )
+
+    return obj_fun
+
+
+def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs, var_auxiliary_variable_z,
+                      var_cus_off_duration, hat_auxiliary_variable_z, hat_bs_2_uav_freqs, hat_uav_sen_beams,
+                      hat_uav_off_beams, cus_entertaining_task_size, uavs_off_duration, cus_off_power,
+                      matched_uav_sensing_channel, uavs_2_bs_channels, cus_2_bs_channels,
+                      uavs_cus_matched_matrix, noise_power):
+    """
+    定义 P6 问题的所有约束条件。
+
+    额外参数说明:
+        matched_uav_sensing_channel : ndarray (I, N, N) — 每个 UAV 对应目标的感知信道矩阵 A_i
+        uavs_2_bs_channels          : ndarray (I, 1, N) — UAV 到 BS 的 MIMO 信道向量 h_{u_i,BS}
+        cus_2_bs_channels           : ndarray (J, 1)   — CU 到 BS 的 SISO 信道系数 h_{c_j,BS}
+        uavs_cus_matched_matrix     : ndarray (I, J)   — 频谱共享因子矩阵 η_{i,j}
+        noise_power                 : float            — 加性高斯白噪声功率 σ^2 (W)
+    """
+    constraints = []
+
+    I        = args.uavs_num
+    J        = args.cus_num
+    N        = args.antenna_nums
+    B        = args.bandwidth                  # 带宽 (Hz)
+    D_sen    = args.uav_sen_duration           # 感知时长 D̄_sen
+    D_max_ui = args.uav_max_delay              # UAV 最大时延 D^max_{u_i}
+    D_max_cj = args.cu_max_delay               # CU 最大时延 D^max_{c_j}
+    C_bit    = args.bs_cycles_per_bit          # BS 每 bit 所需周期数 C_{u_i} = C_{c_j}
+    P_max    = dbm_2_watt(args.uav_max_power)  # UAV 最大发射功率 P^max_UAV
+    F_max    = args.bs_max_freq                # BS 最大计算频率 F^max
+    eps_snr  = db_2_watt(args.sen_sinr)        # 感知 SINR 门限 ε（默认 0 dB）
+
+    # ---------- 雷达相关参数 ----------
+    # ξ1 = δ / (2ν),  ξ2 = 2σ^2_pre γ^2 B^3 ν
+    xi1 = args.radar_duty_ratio / (2.0 * args.radar_impulse_duration)
+    xi2 = (2.0 * args.var_range_fluctuation
+           * (args.radar_spectrum_shape ** 2)
+           * (args.bandwidth ** 3)
+           * args.radar_impulse_duration)
+
+    # ---------- 噪声协方差矩阵 Δ_i = σ^2 I_N ----------
+    Delta = noise_power * np.eye(N)                        # (N, N)
+    # log2 det(Δ_i) = N · log2(σ^2)
+    log2_det_Delta = N * np.log2(noise_power)
+
+    # ---------- 预计算 H_{u_i,BS} = h_{u_i,BS} h^H_{u_i,BS} ----------
+    H_ui_BS_list = []
+    for i in range(I):
+        h_i = uavs_2_bs_channels[i, 0, :]             # (N,)
+        H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))   # (N, N)
+
+    # ---------- 预计算 |h_{c_j,BS}|^2 ----------
+    cu_ch_gain_sq = np.array([abs(cus_2_bs_channels[j, 0]) ** 2 for j in range(J)])
+
+    # ==============================
+    # 约束 (4.1):
+    #   D̄_sen + D^off_{u_i} ≤ \sum_{j = 1}^{J} D^off_{c_j},  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        for j in range(J):
+            constraints.append(
+                D_sen + uavs_off_duration[i] <= uavs_cus_matched_matrix[i:] * var_cus_off_duration
+            )
+
+    # ==============================
+    # 约束 (4.12):
+    #   D̄_sen·f_{u_i} + D^off_{u_i}·f_{u_i} - D^max_{u_i}·f_{u_i}
+    #   + C_{u_i}·D̄_sen·z_i ≤ 0,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        coeff = D_sen + uavs_off_duration[i] - D_max_ui   # 常数系数（通常为负）
+        constraints.append(
+            coeff * var_bs_2_uav_freqs[i]
+            + C_bit * D_sen * var_auxiliary_variable_z[i] <= 0
+        )
+
+    # ==============================
+    # 约束 (4.16):
+    #   W_i(t) ⪰ 0,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        constraints.append(var_uavs_sen_beam[i] >> 0)
+
+    # ==============================
+    # 约束 (4.18):
+    #   B_i(t) ⪰ 0,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        constraints.append(var_uavs_off_beam[i] >> 0)
+
+    # ==============================
+    # 约束 (4.20):
+    #   Tr(W_i(t)) ≤ P^max_UAV,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        constraints.append(cp.real(cp.trace(var_uavs_sen_beam[i])) <= P_max)
+
+    # ==============================
+    # 约束 (4.21):
+    #   ε - Tr(A^H(θ_i) Δ^{-1}_i A(θ_i) W_i(t)) ≤ 0,  ∀u_i ∈ U
+    # ==============================
+    Delta_inv = np.linalg.inv(Delta)                       # (N, N)
+    for i in range(I):
+        A_i = matched_uav_sensing_channel[i]               # (N, N)
+        # M_i = A^H Δ^{-1} A — 常数矩阵
+        M_i = A_i.conj().T @ Delta_inv @ A_i               # (N, N)
+        constraints.append(
+            eps_snr - cp.real(cp.trace(M_i @ var_uavs_sen_beam[i])) <= 0
+        )
+
+    # ==============================
+    # 约束 (4.22):
+    #   Tr(B_i(t)) ≤ P^max_UAV,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        constraints.append(cp.real(cp.trace(var_uavs_off_beam[i])) <= P_max)
+
+    # ==============================
+    # 约束 (4.25):
+    #   D̄_sen·z_i
+    #   - B·D^off_{u_i}·log2(Tr(H_{u_i,BS}·B_i) + Σ_j η_{i,j}·p_j·|h_{c_j,BS}|^2 + σ^2)
+    #   + B·D^off_{u_i}·log2(Σ_j η_{i,j}·p_j·|h_{c_j,BS}|^2 + σ^2) ≤ 0,  ∀u_i ∈ U
+    # ==============================
+    for i in range(I):
+        H_i = H_ui_BS_list[i]                             # (N, N)
+        # 干扰功率（常数）: Σ_j η_{i,j} p_j |h_{c_j,BS}|^2
+        interf = float(np.sum(uavs_cus_matched_matrix[i, :] * cus_off_power * cu_ch_gain_sq))
+        # log2(干扰 + σ^2) — 常数项
+        log2_interf_plus_noise = np.log2(interf + noise_power)
+
+        constraints.append(
+            D_sen * var_auxiliary_variable_z[i]
+            - B * uavs_off_duration[i]
+              * cp.log(cp.real(cp.trace(H_i @ var_uavs_off_beam[i])) + interf + noise_power)
+              / np.log(2)
+            + B * uavs_off_duration[i] * log2_interf_plus_noise
+            <= 0
+        )
+
+    # ==============================
+    # 约束 (4.32):
+    #   D^max_{c_j} - D^off_{c_j} > 0,  ∀c_j ∈ C
+    #   (保证 f_{c_j} = C_{c_j}L_j/(D^max_{c_j}-D^off_{c_j}) 始终为正)
+    # ==============================
+    eps_strict = 1e-6
+    for j in range(J):
+        constraints.append(var_cus_off_duration[j] <= D_max_cj - eps_strict)
+
+    # ==============================
+    # 约束 (4.33):
+    #   Σ_{u_i} f_{u_i} + Σ_{c_j} C_{c_j}·L_j/(D^max_{c_j}-D^off_{c_j}) ≤ F^max
+    # ==============================
+    freq_sum = cp.sum(var_bs_2_uav_freqs)
+    for j in range(J):
+        freq_sum = freq_sum + C_bit * cus_entertaining_task_size[j] * cp.inv_pos(
+            D_max_cj - var_cus_off_duration[j]
+        )
+    constraints.append(freq_sum <= F_max)
+
+    # ==============================
+    # 约束 (4.38): 对约束 (4.23) 进行 CCCP 线性化（第 n+1 次迭代）
+    #
+    #   -ξ1·log2det(Δ_i) - z_i(t)
+    #   + ξ1·log2det(Ψ^{(n)}_i)
+    #   + ξ1·ξ2/ln2 · Tr(A^H·(Ψ^{(n)}_i)^{-1}·A·(W_i - W^{(n)}_i)) ≤ 0,  ∀u_i ∈ U
+    #
+    #   其中 Ψ^{(n)}_i = Δ_i + ξ2·A_i·W^{(n)}_i·A^H_i
+    # ==============================
+    for i in range(I):
+        A_i     = matched_uav_sensing_channel[i]           # (N, N)
+        hat_W_i = hat_uav_sen_beams[i]                     # (N, N)
+
+        # Ψ^{(n)}_i = Δ + ξ2 · A_i W^{(n)}_i A^H_i
+        Psi_i_n = Delta + xi2 * (A_i @ hat_W_i @ A_i.conj().T)
+
+        # log2 det(Ψ^{(n)}_i)
+        _, logdet = np.linalg.slogdet(Psi_i_n)
+        log2_det_Psi_i_n = logdet / np.log(2)
+
+        # A^H · (Ψ^{(n)}_i)^{-1} · A
+        Psi_i_n_inv = np.linalg.inv(Psi_i_n)
+        G_i = A_i.conj().T @ Psi_i_n_inv @ A_i            # (N, N)
+
+        # 常数部分: -ξ1·log2det(Δ) + ξ1·log2det(Ψ) - ξ1ξ2/ln2·Tr(G_i W^{(n)}_i)
+        const_438 = (- xi1 * log2_det_Delta
+                     + xi1 * log2_det_Psi_i_n
+                     - xi1 * xi2 / np.log(2) * np.real(np.trace(G_i @ hat_W_i)))
+
+        constraints.append(
+            const_438
+            - var_auxiliary_variable_z[i]
+            + xi1 * xi2 / np.log(2) * cp.real(cp.trace(G_i @ var_uavs_sen_beam[i]))
+            <= 0
+        )
+
+    # ==============================
+    # 约束 (4.39): 对约束 (4.24) 进行 CCCP 线性化（第 n+1 次迭代）,  ∀c_j ∈ C
+    #
+    #   L_j
+    #   - B·(Σ_i η_{i,j}·D̄_sen)·log2(p_j|h_{c_j,BS}|^2 + Σ_i η_{i,j}·Tr(H_{u_i,BS}·W_i) + σ^2)
+    #   - B·(Σ_i η_{i,j}·D^off_{u_i})·log2(p_j|h_{c_j,BS}|^2 + Σ_i η_{i,j}·Tr(H_{u_i,BS}·B_i) + σ^2)
+    #   - B·(D^off_{c_j} - Σ_i η_{i,j}·D̄_sen - Σ_i η_{i,j}·D^off_{u_i})·log2(1 + p_j|h_{c_j,BS}|^2/σ^2)
+    #   + B·(Σ_i η_{i,j}·D̄_sen)·log2(Ψ^{(n)}_{j,1})
+    #   + B·(Σ_i η_{i,j}·D^off_{u_i})·log2(Ψ^{(n)}_{j,2})
+    #   + B·(Σ_i η_{i,j}·D̄_sen)/(ln2·Ψ^{(n)}_{j,1}) · Σ_i η_{i,j}·Tr(H_{u_i,BS}·(W_i-W^{(n)}_i))
+    #   + B·(Σ_i η_{i,j}·D^off_{u_i})/(ln2·Ψ^{(n)}_{j,2}) · Σ_i η_{i,j}·Tr(H_{u_i,BS}·(B_i-B^{(n)}_i))
+    #   ≤ 0
+    #
+    #   其中 Ψ^{(n)}_{j,1} = Σ_i η_{i,j}·Tr(H_{u_i,BS}·W^{(n)}_i) + σ^2
+    #        Ψ^{(n)}_{j,2} = Σ_i η_{i,j}·Tr(H_{u_i,BS}·B^{(n)}_i) + σ^2
+    # ==============================
+    for j in range(J):
+        p_j      = cus_off_power[j]
+        h_cj_sq  = cu_ch_gain_sq[j]                       # |h_{c_j,BS}|^2
+
+        # 聚合系数（常数）
+        sum_eta_D_sen = D_sen   * float(np.sum(uavs_cus_matched_matrix[:, j]))
+        sum_eta_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
+
+        # log2(1 + p_j|h|^2/σ^2) — 常数
+        log2_cu_snr = np.log2(1.0 + p_j * h_cj_sq / noise_power)
+
+        # ---------- 预计算 Ψ^{(n)}_{j,1} 和 Ψ^{(n)}_{j,2} ----------
+        Psi_j1_n = noise_power
+        Psi_j2_n = noise_power
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                Psi_j1_n += eta_ij * np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i]))
+                Psi_j2_n += eta_ij * np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i]))
+
+        # ---------- 构建 CVXPY 变量表达式 ----------
+        # arg_W = p_j|h|^2 + Σ_i η_{i,j} Tr(H_{u_i,BS} W_i) + σ^2
+        # arg_B = p_j|h|^2 + Σ_i η_{i,j} Tr(H_{u_i,BS} B_i) + σ^2
+        arg_W = p_j * h_cj_sq + noise_power   # 从常数开始累加
+        arg_B = p_j * h_cj_sq + noise_power
+        # grad_W_expr = Σ_i η_{i,j} Tr(H_{u_i,BS} (W_i - W^{(n)}_i))
+        # grad_B_expr = Σ_i η_{i,j} Tr(H_{u_i,BS} (B_i - B^{(n)}_i))
+        grad_W_expr = 0.0
+        grad_B_expr = 0.0
+
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                H_i          = H_ui_BS_list[i]
+                tr_H_Wi      = cp.real(cp.trace(H_i @ var_uavs_sen_beam[i]))
+                tr_H_Bi      = cp.real(cp.trace(H_i @ var_uavs_off_beam[i]))
+                tr_H_hatWi   = float(np.real(np.trace(H_i @ hat_uav_sen_beams[i])))
+                tr_H_hatBi   = float(np.real(np.trace(H_i @ hat_uav_off_beams[i])))
+
+                arg_W      = arg_W      + eta_ij * tr_H_Wi
+                arg_B      = arg_B      + eta_ij * tr_H_Bi
+                grad_W_expr = grad_W_expr + eta_ij * (tr_H_Wi - tr_H_hatWi)
+                grad_B_expr = grad_B_expr + eta_ij * (tr_H_Bi - tr_H_hatBi)
+
+        # ---------- 组装线性化约束 ----------
+        # 凸项：-B · coeff · log2(arg)，用 cp.log() 表示
+        if sum_eta_D_sen > 0:
+            term_W_log = -B * sum_eta_D_sen * cp.log(arg_W) / np.log(2)
+        else:
+            term_W_log = 0.0
+
+        if sum_eta_D_off > 0:
+            term_B_log = -B * sum_eta_D_off * cp.log(arg_B) / np.log(2)
+        else:
+            term_B_log = 0.0
+
+        # 含变量 D^off_{c_j} 的线性项
+        term_Dcj = -B * (var_cus_off_duration[j] - sum_eta_D_sen - sum_eta_D_off) * log2_cu_snr
+
+        # 线性化 ℱ^‡_2 的常数部分
+        psi_const = (B * sum_eta_D_sen * np.log2(Psi_j1_n)
+                     + B * sum_eta_D_off * np.log2(Psi_j2_n))
+
+        # 梯度修正项
+        if sum_eta_D_sen > 0 and not isinstance(grad_W_expr, float):
+            grad_W_full = B * sum_eta_D_sen / (np.log(2) * Psi_j1_n) * grad_W_expr
+        else:
+            grad_W_full = 0.0
+
+        if sum_eta_D_off > 0 and not isinstance(grad_B_expr, float):
+            grad_B_full = B * sum_eta_D_off / (np.log(2) * Psi_j2_n) * grad_B_expr
+        else:
+            grad_B_full = 0.0
+
+        constraints.append(
+            cus_entertaining_task_size[j]
+            + term_W_log
+            + term_B_log
+            + term_Dcj
+            + psi_const
+            + grad_W_full
+            + grad_B_full
+            <= 0
+        )
+
+    # ==============================
+    # var 变量的基本非负约束
+    # ==============================
+    # f_{u_i} ≥ 0
+    constraints.append(var_bs_2_uav_freqs >= 0)
+    # z_i ≥ 0
+    constraints.append(var_auxiliary_variable_z >= 0)
+    # D^off_{c_j} ≥ 0
+    constraints.append(var_cus_off_duration >= 0)
+
+    return constraints
+
+
+def penalty_based_cccp(args,
+                       uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
+                       uavs_targets_matched_matrix, uavs_cus_matched_matrix,
+                       uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power
+                       ):
+    """
+    基于惩罚的 CCCP 算法
     
-    radar_duty_ratio = args.radar_duty_ratio
-    variance_of_range_fluctuation_process = args.var_range_fluctuation
-    radar_impulse_duration = args.radar_impulse_duration
-    radar_spectrum_shape = args.radar_spectrum_shape
+    :param args: 包含所有基础参数的命名空间
+    :param uavs_2_cus_channels: UAVs 到 CUs 的信道响应矩阵 (I * J * N * N)
+    :param uavs_2_bs_channels: UAVs 到 BS 的信道响应矩阵 (I * 1 * N)
+    :param cus_2_bs_channels: CUs 到 BS 的信道响应矩阵 (J * 1)
+    :param uavs_2_targets_channels: UAVs 到 targets 的信道响应矩阵 (I * K * N * N)
+    :param uavs_targets_matched_matrix: UAVs 和 targets 的匹配矩阵 (I * K) 
+    :param uavs_cus_matched_matrix: UAVs 和 CUs 的匹配矩阵 (I * J) (DRL 输出)
+    :param uavs_pos_pre: UAVs 前一时刻位置 (I * 3)
+    :param uavs_pos_cur: UAVs 当前时刻位置 (I * 3)
+    :return: 目标函数总延迟
+    """
+    # 定义 CU 的娱乐任务量大小
+    cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
     
-    pass
+    # 根据匹配矩阵提取对应的信道响应矩阵
+    # 结果维度: (I, N, N)，其中 I 是 UAV 数量，N 是天线数量
+    matched_uav_sensing_channel \
+        = extract_matched_sensing_channel(uavs_targets_matched_matrix = uavs_targets_matched_matrix,
+                                          uavs_2_targets_channels = uavs_2_targets_channels
+                                          )
+
+    # 最优目标函数值初始化
+    obj_fun_opt = float('inf')
+    pre_obj_fun_val = float('inf')  # 设置一个初始的前一次目标函数值, 对于能耗而言足够大就行
+    # 声明优化变量
+    var_uavs_sen_beam = [cp.Variable((args.antenna_nums, args.antenna_nums), hermitian=True) for _ in range(args.uavs_num)]
+    var_uavs_off_beam = [cp.Variable((args.antenna_nums, args.antenna_nums), hermitian=True) for _ in range(args.uavs_num)]
+    var_bs_2_uav_freqs = cp.Variable(args.uavs_num)
+    var_auxiliary_variable_z = cp.Variable(args.uavs_num)
+    var_cus_off_duration = cp.Variable(args.cus_num)
+    # 声明初始值
+    hat_auxiliary_variable_z = np.ones(args.uavs_num) * 1e-3
+    hat_bs_2_uav_freqs = np.ones(args.uavs_num) * (args.bs_max_freq / args.uavs_num * 0.5)
+    hat_uav_sen_beams, hat_uav_off_beams = initialize_uav_beams(args = args,
+                                                                matched_uav_sensing_channel = matched_uav_sensing_channel,
+                                                                uavs_2_bs_channels = uavs_2_bs_channels
+                                                                )
+    # 罚因子和缩放系数
+    cur_penalty_factor = args.penalty_factor
+
+    print("-------------------------------------------------------- ")
+    print(f"-------------------- CCCP算法开始迭代 -------------------- ")
+    print("-------------------------------------------------------- ")
+    iter_count = 0  # 记录迭代次数
+
+    for iter in range(args.max_iterations):
+        # 定义目标函数
+        obj_fun = compute_obj_fun(args = args,
+                                  var_uavs_sen_beam = var_uavs_sen_beam,
+                                  var_uavs_off_beam = var_uavs_off_beam,
+                                  var_bs_2_uav_freqs = var_bs_2_uav_freqs,
+                                  var_auxiliary_variable_z = var_auxiliary_variable_z,
+                                  var_cus_off_duration = var_cus_off_duration,
+                                  hat_auxiliary_variable_z = hat_auxiliary_variable_z,
+                                  hat_bs_2_uav_freqs = hat_bs_2_uav_freqs,
+                                  hat_uav_sen_beams = hat_uav_sen_beams,
+                                  hat_uav_off_beams = hat_uav_off_beams,
+                                  cus_entertaining_task_size = cus_entertaining_task_size,
+                                  uavs_off_duration = uavs_off_duration,
+                                  cus_off_power = cus_off_power,
+                                  uavs_pos_pre = uavs_pos_pre,
+                                  uavs_pos_cur = uavs_pos_cur,
+                                  cur_penalty_factor = cur_penalty_factor
+                                  )
+        # 定义约束
+        constraints = define_constraint(args = args,
+                                        var_uavs_sen_beam=var_uavs_sen_beam,
+                                        var_uavs_off_beam=var_uavs_off_beam,
+                                        var_bs_2_uav_freqs=var_bs_2_uav_freqs,
+                                        var_auxiliary_variable_z=var_auxiliary_variable_z,
+                                        var_cus_off_duration=var_cus_off_duration,
+                                        hat_auxiliary_variable_z=hat_auxiliary_variable_z,
+                                        hat_bs_2_uav_freqs=hat_bs_2_uav_freqs,
+                                        hat_uav_sen_beams=hat_uav_sen_beams,
+                                        hat_uav_off_beams=hat_uav_off_beams,
+                                        cus_entertaining_task_size=cus_entertaining_task_size,
+                                        uavs_off_duration=uavs_off_duration,
+                                        cus_off_power=cus_off_power,
+                                        )
+        # 创建并求解
+        problem = cp.Problem(cp.Minimize(obj_fun), constraints)
+        problem.solve(solver=cp.SCS, warm_start=True)
+
+        # print("status:", problem.status)
+
+        # 计算当前目标函数值
+        cur_obj_fun_val = problem.value
+
+        # 检查收敛性
+        if abs(cur_obj_fun_val - pre_obj_fun_val) < args.cccp_threshold:
+            iter_count = iter + 1
+            print(f"CCCP算法迭代过程收敛在第 {iter_count + 1} 轮")
+            obj_fun_opt = cur_obj_fun_val
+            # 当前优化结果
+            print(f"UAV 感知波束 = {[v.value for v in var_uavs_sen_beam]}" )
+            print(f"UAV 卸载波束 = {[v.value for v in var_uavs_off_beam]}" )
+            print(f"BS 计算频率 = {var_bs_2_uav_freqs.value}" )
+            print(f"辅助变量 z = {var_auxiliary_variable_z.value}" )
+            print(f"CU 卸载持续时长 = {var_cus_off_duration.value}" )
+            break
+
+        # 下一轮迭代赋值
+        hat_uav_sen_beams = [v.value for v in var_uavs_sen_beam]
+        hat_uav_off_beams = [v.value for v in var_uavs_off_beam]
+        hat_auxiliary_variable_z = var_auxiliary_variable_z.value
+        hat_bs_2_uav_freqs = var_bs_2_uav_freqs.value
+
+        # 更新罚因子
+        cur_penalty_factor *= args.zoom_factor
+
+        # 更新当前目标函数值
+        pre_obj_fun_val = cur_obj_fun_val
+
+    return obj_fun_opt, iter_count
+
 
 def dbm_2_watt(dbm):
     """
@@ -374,7 +981,7 @@ def db_2_watt(db):
 
 if __name__ == "__main__":
     # 获取参数
-    args = get_args()
+    args = get_base_args()
     
     # 结果参数设定
     num_cases = args.num_cases  # 随机案例数量
@@ -383,15 +990,10 @@ if __name__ == "__main__":
     time_result = []  # 存储每个案例的CCCP执行时长
     np.random.seed(args.seed)  # 确保仿真结果可复现
     
-    # 仿真参数设定
-    targets_num = args.targets_num
-    uavs_num = targets_num
-    cus_num = args.cus_num
-    
     uavs_pos, cus_pos, targets_pos \
-        = generate_pos(uavs_num = uavs_num,  # UAVs 数量和 targets 数量设置相同
-                       cus_num = cus_num,  # CUs 的数量多于 UAVs
-                       targets_num = targets_num,
+        = generate_pos(uavs_num = args.uavs_num,  # UAVs 数量和 targets 数量设置相同
+                       cus_num = args.cus_num,  # CUs 的数量多于 UAVs
+                       targets_num = args.targets_num,
                        center = (0, 0),
                        radius = args.radius,
                        uav_height = args.uav_height
@@ -408,24 +1010,24 @@ if __name__ == "__main__":
                                    alpha_uav_link = args.alpha_uav_link,  # 与 UAV 有关链路的路径损耗系数
                                    alpha_cu_link = args.alpha_cu_link,  # 与 CU 有关的路径损耗系数
                                    rician_factor = db_2_watt(args.rician_factor_db),  # Rician 因子
-                                   antennas_nums = args.antennas_nums  # UAV 天线数量
-                                   )  # 计算论文通信信道增益
+                                   antenna_nums = args.antenna_nums  # UAV 天线数量
+                                   )  # 计算通信信道增益
     
-    # uavs_2_targets_channels: UAVs -> targets 信道响应矩阵
+    # uavs_2_targets_channels: UAVs -> targets 信道响应矩阵 (I * I * N * N)
     uavs_2_targets_channels \
         = compute_sen_channel_gain(radar_rcs = args.radar_rcs,  # 目标 RCS
                                    frac_d_lambda = args.frac_d_lambda,  # 天线间距为半波长
                                    uavs_pos = uavs_pos,
                                    targets_pos = targets_pos,
-                                   antennas_nums = args.antennas_nums,  # UAV 天线数量
+                                   antenna_nums = args.antenna_nums,  # UAV 天线数量
                                    ref_path_loss = db_2_watt(args.ref_path_loss_db)  # 1m 下参考路径损耗
-                                   )  # 计算论文感知信道响应矩阵
+                                   )  # 计算感知信道响应矩阵
     
-    # 随机选择 UAVs 复用 CUs 的信道
+    # 随机选择 UAVs 复用 CUs 的信道 : 满足约束 (UAV 只能复用一个 CU 的频谱) && (一个 CU 的频谱只能被一个 UAV 复用)
     uavs_cus_matched_matrix \
         = random_choose_matched_matrix(uavs_pos = uavs_pos,
                                        cus_pos = cus_pos
-                                       )  # 随机匹配 UAVs 和 CUs 并确保 CU 只能选择一个 UAV 和一个 UAV 只能被一个 CU 选择
+                                       )
     
     # 每个 UAV 默认感知距离最近的目标 (使用匈牙利算法进行一一匹配)
     uavs_targets_matched_matrix \
@@ -433,16 +1035,24 @@ if __name__ == "__main__":
                                     targets_pos = targets_pos
                                     )
     
-    # 根据匹配矩阵提取对应的信道响应矩阵
-    # 结果维度: (I, N, N)，其中 I 是 UAV 数量，N 是天线数量
-    matched_uav_sensing_channel \
-        = extract_matched_sensing_channel(uavs_targets_matched_matrix = uavs_targets_matched_matrix,
-                                          uavs_2_targets_channels = uavs_2_targets_channels
-                                          )
-    
-    delay_opt = penalty_based_cccp(args = args, 
-                                   uavs_2_cus_channels = uavs_2_cus_channels,
-                                   uavs_2_bs_channels = uavs_2_bs_channels,
-                                   cus_2_bs_channels = cus_2_bs_channels,
-                                   matched_uav_sensing_channel = matched_uav_sensing_channel
-                                   )
+    # UAV 当前位置 (DRL 输出)
+    uavs_pos_cur = compute_uav_pos_cur(args = args,
+                                       uavs_pos_pre = uavs_pos
+                                       )
+    # UAV 卸载时长 (DRL 输出)
+    uavs_off_duration = np.full(args.uavs_num, args.uav_max_delay - args.uav_sen_duration)
+    # CU 发射功率 (DRL 输出)
+    cus_off_power = np.full(args.cus_num, dbm_2_watt(args.cu_max_power_dbm) / 2)
+
+    # 采用基于惩罚的 CCCP 算法计算出最优的能耗和迭代次数
+    energy_opt, iter_count = penalty_based_cccp(args = args, 
+                                                uavs_2_cus_channels = uavs_2_cus_channels,
+                                                uavs_2_bs_channels = uavs_2_bs_channels,
+                                                cus_2_bs_channels = cus_2_bs_channels,
+                                                uavs_2_targets_channels = uavs_2_targets_channels,
+                                                uavs_targets_matched_matrix = uavs_targets_matched_matrix,
+                                                uavs_cus_matched_matrix = uavs_cus_matched_matrix,
+                                                uavs_pos_pre = uavs_pos,
+                                                uavs_pos_cur = uavs_pos_cur,
+                                                uavs_off_duration = uavs_off_duration,
+                                                cus_off_power = cus_off_power)
