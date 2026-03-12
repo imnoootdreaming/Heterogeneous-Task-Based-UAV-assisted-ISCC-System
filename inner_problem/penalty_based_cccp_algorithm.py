@@ -529,308 +529,438 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     return obj_fun
 
 
-def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs, var_auxiliary_variable_z,
-                      var_cus_off_duration, hat_auxiliary_variable_z, hat_bs_2_uav_freqs, hat_uav_sen_beams,
-                      hat_uav_off_beams, cus_entertaining_task_size, uavs_off_duration, cus_off_power,
-                      matched_uav_sensing_channel, uavs_2_bs_channels, cus_2_bs_channels,
-                      uavs_cus_matched_matrix, noise_power):
+def define_constraint(args,
+                      var_uavs_sen_beam, var_uavs_off_beam,
+                      var_bs_2_uav_freqs, var_auxiliary_variable_z,
+                      var_cus_off_duration,
+                      hat_uav_sen_beams, hat_uav_off_beams,
+                      cus_entertaining_task_size,
+                      uavs_off_duration, cus_off_power,
+                      matched_uav_sensing_channel,
+                      uavs_2_cus_channels,          # ← 新增：用于计算 Δ_i
+                      uavs_2_bs_channels,
+                      cus_2_bs_channels,
+                      uavs_cus_matched_matrix):
     """
-    定义 P6 问题的所有约束条件。
-
-    额外参数说明:
-        matched_uav_sensing_channel : ndarray (I, N, N) — 每个 UAV 对应目标的感知信道矩阵 A_i
-        uavs_2_bs_channels          : ndarray (I, 1, N) — UAV 到 BS 的 MIMO 信道向量 h_{u_i,BS}
-        cus_2_bs_channels           : ndarray (J, 1)   — CU 到 BS 的 SISO 信道系数 h_{c_j,BS}
-        uavs_cus_matched_matrix     : ndarray (I, J)   — 频谱共享因子矩阵 η_{i,j}
-        noise_power                 : float            — 加性高斯白噪声功率 σ^2 (W)
+    定义问题 P6 的所有约束。
+    每条约束均附有与论文公式一一对应的逐行注释，方便核对。
     """
     constraints = []
 
+    # ── 基础标量参数 ──────────────────────────────────────────────────────────
     I        = args.uavs_num
     J        = args.cus_num
     N        = args.antenna_nums
-    B        = args.bandwidth                  # 带宽 (Hz)
-    D_sen    = args.uav_sen_duration           # 感知时长 D̄_sen
-    D_max_ui = args.uav_max_delay              # UAV 最大时延 D^max_{u_i}
-    D_max_cj = args.cu_max_delay               # CU 最大时延 D^max_{c_j}
-    C_bit    = args.bs_cycles_per_bit          # BS 每 bit 所需周期数 C_{u_i} = C_{c_j}
-    P_max    = dbm_2_watt(args.uav_max_power)  # UAV 最大发射功率 P^max_UAV
-    F_max    = args.bs_max_freq                # BS 最大计算频率 F^max
-    eps_snr  = db_2_watt(args.sen_sinr)        # 感知 SINR 门限 ε（默认 0 dB）
+    B        = args.bandwidth                                  # 带宽 (Hz)
+    sigma_2  = dbm_2_watt(args.noise_power_density_dbm) * B   # 噪声功率 σ²
+    D_sen    = args.uav_sen_duration                           # D̄_sen
+    D_max_ui = args.uav_max_delay                              # D^max_{u_i}
+    D_max_cj = args.cu_max_delay                               # D^max_{c_j}
+    C_bit    = args.bs_cycles_per_bit                          # C_{u_i} = C_{c_j}
+    P_max    = args.uav_max_power                              # P^max_UAV (W)，已是瓦特，无需再转换
+    F_max    = args.bs_max_freq                                # F^max
+    eps_snr  = db_2_watt(args.sen_sinr)                        # 感知 SINR 门限 ε
 
-    # ---------- 雷达相关参数 ----------
-    # ξ1 = δ / (2ν),  ξ2 = 2σ^2_pre γ^2 B^3 ν
+    # ── 雷达参数 ─────────────────────────────────────────────────────────────
+    # ξ1 = δ / (2ν)
     xi1 = args.radar_duty_ratio / (2.0 * args.radar_impulse_duration)
+    # ξ2 = 2 σ²_pre γ² B³ ν
     xi2 = (2.0 * args.var_range_fluctuation
            * (args.radar_spectrum_shape ** 2)
            * (args.bandwidth ** 3)
            * args.radar_impulse_duration)
 
-    # ---------- 噪声协方差矩阵 Δ_i = σ^2 I_N ----------
-    Delta = noise_power * np.eye(N)                        # (N, N)
-    # log2 det(Δ_i) = N · log2(σ^2)
-    log2_det_Delta = N * np.log2(noise_power)
+    # ── 预计算 Δ_i ────────────────────────────────────────────
+    #
+    # Δ_i = Σ_{j=1}^{J} η_{i,j} · p_j · h_{u_i,c_j} · h^H_{u_i,c_j} + σ² I_N
+    #
+    # uavs_2_cus_channels shape: (I, J, N)，其中第三维为 UAV 天线方向
+    Delta_list = []
+    for i in range(I):
+        Delta_i = sigma_2 * np.eye(N, dtype=complex)           # σ² I_N
+        for j in range(J):
+            eta_ij = uavs_cus_matched_matrix[i, j]             # η_{i,j}
+            if eta_ij > 0:
+                h_ij   = uavs_2_cus_channels[i, j, :]          # h_{u_i,c_j}，shape (N,)
+                Delta_i = (Delta_i
+                           + eta_ij                             # η_{i,j}
+                           * cus_off_power[j]                  # · p_j
+                           * np.outer(h_ij, np.conj(h_ij)))    # · h_{u_i,c_j} h^H_{u_i,c_j}
+        Delta_list.append(Delta_i)
 
-    # ---------- 预计算 H_{u_i,BS} = h_{u_i,BS} h^H_{u_i,BS} ----------
+    # ── 预计算 H_{u_i,BS} = h_{u_i,BS} h^H_{u_i,BS} ─────────────────────────
+    # uavs_2_bs_channels shape: (I, 1, N)
     H_ui_BS_list = []
     for i in range(I):
-        h_i = uavs_2_bs_channels[i, 0, :]             # (N,)
-        H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))   # (N, N)
+        h_i = uavs_2_bs_channels[i, 0, :]                      # h_{u_i,BS}，shape (N,)
+        H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))       # H_{u_i,BS}，shape (N, N)
 
-    # ---------- 预计算 |h_{c_j,BS}|^2 ----------
-    cu_ch_gain_sq = np.array([abs(cus_2_bs_channels[j, 0]) ** 2 for j in range(J)])
+    # ── 预计算 |h_{c_j,BS}|² ─────────────────────────────────────────────────
+    # cus_2_bs_channels shape: (J, 1)
+    h_cj_BS_sq = np.array([abs(cus_2_bs_channels[j, 0]) ** 2 for j in range(J)])
 
-    # ==============================
-    # 约束 (4.1):
-    #   D̄_sen + D^off_{u_i} ≤ \sum_{j = 1}^{J} D^off_{c_j},  ∀u_i ∈ U
-    # ==============================
+    # =========================================================================
+    # 约束 (4.5)：D̄_sen + D^off_{u_i} - Σ_{j=1}^{J} η_{i,j} D^off_{c_j} ≤ 0，∀u_i ∈ U
+    # =========================================================================
     for i in range(I):
-        for j in range(J):
-            constraints.append(
-                D_sen + uavs_off_duration[i] <= uavs_cus_matched_matrix[i:] * var_cus_off_duration
-            )
-
-    # ==============================
-    # 约束 (4.12):
-    #   D̄_sen·f_{u_i} + D^off_{u_i}·f_{u_i} - D^max_{u_i}·f_{u_i}
-    #   + C_{u_i}·D̄_sen·z_i ≤ 0,  ∀u_i ∈ U
-    # ==============================
-    for i in range(I):
-        coeff = D_sen + uavs_off_duration[i] - D_max_ui   # 常数系数（通常为负）
         constraints.append(
-            coeff * var_bs_2_uav_freqs[i]
-            + C_bit * D_sen * var_auxiliary_variable_z[i] <= 0
+            D_sen                                               # D̄_sen
+            + uavs_off_duration[i]                             # + D^off_{u_i}
+            - cp.sum(                                          # - Σ_{j=1}^{J}
+                uavs_cus_matched_matrix[i, :] *                #   η_{i,j}
+                var_cus_off_duration                           #   · D^off_{c_j}
+            )
+            <= 0
         )
 
-    # ==============================
-    # 约束 (4.16):
-    #   W_i(t) ⪰ 0,  ∀u_i ∈ U
-    # ==============================
+    # =========================================================================
+    # 约束 (4.12)：
+    #   D̄_sen · f_{u_i} + D^off_{u_i} · f_{u_i} - D^max_{u_i} · f_{u_i}
+    #   + C_{u_i} · D̄_sen · z_i ≤ 0，∀u_i ∈ U
+    # =========================================================================
+    for i in range(I):
+        constraints.append(
+            D_sen * var_bs_2_uav_freqs[i]                      # D̄_sen · f_{u_i}
+            + uavs_off_duration[i] * var_bs_2_uav_freqs[i]    # + D^off_{u_i} · f_{u_i}
+            - D_max_ui * var_bs_2_uav_freqs[i]                 # - D^max_{u_i} · f_{u_i}
+            + C_bit * D_sen * var_auxiliary_variable_z[i]      # + C_{u_i} · D̄_sen · z_i
+            <= 0
+        )
+
+    # =========================================================================
+    # 约束 (4.21)：W_i(t) ⪰ 0，∀u_i ∈ U
+    # =========================================================================
     for i in range(I):
         constraints.append(var_uavs_sen_beam[i] >> 0)
 
-    # ==============================
-    # 约束 (4.18):
-    #   B_i(t) ⪰ 0,  ∀u_i ∈ U
-    # ==============================
+    # =========================================================================
+    # 约束 (4.23)：B_i(t) ⪰ 0，∀u_i ∈ U
+    # =========================================================================
     for i in range(I):
         constraints.append(var_uavs_off_beam[i] >> 0)
 
-    # ==============================
-    # 约束 (4.20):
-    #   Tr(W_i(t)) ≤ P^max_UAV,  ∀u_i ∈ U
-    # ==============================
+    # =========================================================================
+    # 约束 (4.25)：Tr(W_i) - P^max_UAV ≤ 0，∀u_i ∈ U
+    # =========================================================================
     for i in range(I):
-        constraints.append(cp.real(cp.trace(var_uavs_sen_beam[i])) <= P_max)
-
-    # ==============================
-    # 约束 (4.21):
-    #   ε - Tr(A^H(θ_i) Δ^{-1}_i A(θ_i) W_i(t)) ≤ 0,  ∀u_i ∈ U
-    # ==============================
-    Delta_inv = np.linalg.inv(Delta)                       # (N, N)
-    for i in range(I):
-        A_i = matched_uav_sensing_channel[i]               # (N, N)
-        # M_i = A^H Δ^{-1} A — 常数矩阵
-        M_i = A_i.conj().T @ Delta_inv @ A_i               # (N, N)
         constraints.append(
-            eps_snr - cp.real(cp.trace(M_i @ var_uavs_sen_beam[i])) <= 0
-        )
-
-    # ==============================
-    # 约束 (4.22):
-    #   Tr(B_i(t)) ≤ P^max_UAV,  ∀u_i ∈ U
-    # ==============================
-    for i in range(I):
-        constraints.append(cp.real(cp.trace(var_uavs_off_beam[i])) <= P_max)
-
-    # ==============================
-    # 约束 (4.25):
-    #   D̄_sen·z_i
-    #   - B·D^off_{u_i}·log2(Tr(H_{u_i,BS}·B_i) + Σ_j η_{i,j}·p_j·|h_{c_j,BS}|^2 + σ^2)
-    #   + B·D^off_{u_i}·log2(Σ_j η_{i,j}·p_j·|h_{c_j,BS}|^2 + σ^2) ≤ 0,  ∀u_i ∈ U
-    # ==============================
-    for i in range(I):
-        H_i = H_ui_BS_list[i]                             # (N, N)
-        # 干扰功率（常数）: Σ_j η_{i,j} p_j |h_{c_j,BS}|^2
-        interf = float(np.sum(uavs_cus_matched_matrix[i, :] * cus_off_power * cu_ch_gain_sq))
-        # log2(干扰 + σ^2) — 常数项
-        log2_interf_plus_noise = np.log2(interf + noise_power)
-
-        constraints.append(
-            D_sen * var_auxiliary_variable_z[i]
-            - B * uavs_off_duration[i]
-              * cp.log(cp.real(cp.trace(H_i @ var_uavs_off_beam[i])) + interf + noise_power)
-              / np.log(2)
-            + B * uavs_off_duration[i] * log2_interf_plus_noise
+            cp.real(cp.trace(var_uavs_sen_beam[i]))            # Tr(W_i)
+            - P_max                                             # - P^max_UAV
             <= 0
         )
 
-    # ==============================
-    # 约束 (4.32):
-    #   D^max_{c_j} - D^off_{c_j} > 0,  ∀c_j ∈ C
-    #   (保证 f_{c_j} = C_{c_j}L_j/(D^max_{c_j}-D^off_{c_j}) 始终为正)
-    # ==============================
+    # =========================================================================
+    # 约束 (4.26)：ε - Tr(A^H(θ_i) Δ^{-1}_i A(θ_i) W_i) ≤ 0，∀u_i ∈ U
+    # =========================================================================
+    for i in range(I):
+        A_i         = matched_uav_sensing_channel[i]            # A(θ_i)，shape (N, N)
+        Delta_i     = Delta_list[i]                             # Δ_i，shape (N, N)
+        Delta_i_inv = np.linalg.inv(Delta_i)                   # Δ^{-1}_i
+        AH_Dinv_A   = A_i.conj().T @ Delta_i_inv @ A_i         # A^H Δ^{-1} A，shape (N, N)
+        constraints.append(
+            eps_snr                                             # ε
+            - cp.real(cp.trace(                                 # - Tr(A^H Δ^{-1} A · W_i)
+                AH_Dinv_A @ var_uavs_sen_beam[i]
+            ))
+            <= 0
+        )
+
+    # =========================================================================
+    # 约束 (4.27)：Tr(B_i) - P^max_UAV ≤ 0，∀u_i ∈ U
+    # =========================================================================
+    for i in range(I):
+        constraints.append(
+            cp.real(cp.trace(var_uavs_off_beam[i]))            # Tr(B_i)
+            - P_max                                             # - P^max_UAV
+            <= 0
+        )
+
+    # =========================================================================
+    # 约束 (4.30)：
+    #   D̄_sen · z_i
+    #   - D^off_{u_i} · B · log2( Tr(H_{u_i,BS} B_i) + Σ_j η_{i,j} p_j |h_{c_j,BS}|² + σ² )
+    #   + D^off_{u_i} · B · log2( Σ_j η_{i,j} p_j |h_{c_j,BS}|² + σ² )
+    #   ≤ 0，∀u_i ∈ U
+    # =========================================================================
+    for i in range(I):
+        H_i = H_ui_BS_list[i]                                  # H_{u_i,BS}，shape (N, N)
+
+        # Σ_j η_{i,j} · p_j · |h_{c_j,BS}|² + σ²（常数）
+        interf_plus_noise = float(
+            np.sum(uavs_cus_matched_matrix[i, :] * cus_off_power * h_cj_BS_sq)
+        ) + sigma_2
+
+        constraints.append(
+            D_sen * var_auxiliary_variable_z[i]                # D̄_sen · z_i
+            - uavs_off_duration[i] * B                         # - D^off_{u_i} · B
+              * cp.log(                                         #   · log(
+                  cp.real(cp.trace(                            #       Tr(H_{u_i,BS} B_i)
+                      H_i @ var_uavs_off_beam[i]
+                  ))
+                  + interf_plus_noise                          #       + Σ_j η p |h|² + σ²
+              ) / np.log(2)
+            + uavs_off_duration[i] * B                         # + D^off_{u_i} · B
+              * np.log2(interf_plus_noise)                      #   · log2( Σ_j η p |h|² + σ² )
+            <= 0
+        )
+
+    # =========================================================================
+    # 约束 (4.37)：D^off_{c_j} - D^max_{c_j} < 0，∀c_j ∈ C
+    #   保证 f_{c_j} = C_{c_j} L_j / (D^max_{c_j} - D^off_{c_j}) 始终为正
+    # =========================================================================
     eps_strict = 1e-6
     for j in range(J):
-        constraints.append(var_cus_off_duration[j] <= D_max_cj - eps_strict)
-
-    # ==============================
-    # 约束 (4.33):
-    #   Σ_{u_i} f_{u_i} + Σ_{c_j} C_{c_j}·L_j/(D^max_{c_j}-D^off_{c_j}) ≤ F^max
-    # ==============================
-    freq_sum = cp.sum(var_bs_2_uav_freqs)
-    for j in range(J):
-        freq_sum = freq_sum + C_bit * cus_entertaining_task_size[j] * cp.inv_pos(
-            D_max_cj - var_cus_off_duration[j]
-        )
-    constraints.append(freq_sum <= F_max)
-
-    # ==============================
-    # 约束 (4.38): 对约束 (4.23) 进行 CCCP 线性化（第 n+1 次迭代）
-    #
-    #   -ξ1·log2det(Δ_i) - z_i(t)
-    #   + ξ1·log2det(Ψ^{(n)}_i)
-    #   + ξ1·ξ2/ln2 · Tr(A^H·(Ψ^{(n)}_i)^{-1}·A·(W_i - W^{(n)}_i)) ≤ 0,  ∀u_i ∈ U
-    #
-    #   其中 Ψ^{(n)}_i = Δ_i + ξ2·A_i·W^{(n)}_i·A^H_i
-    # ==============================
-    for i in range(I):
-        A_i     = matched_uav_sensing_channel[i]           # (N, N)
-        hat_W_i = hat_uav_sen_beams[i]                     # (N, N)
-
-        # Ψ^{(n)}_i = Δ + ξ2 · A_i W^{(n)}_i A^H_i
-        Psi_i_n = Delta + xi2 * (A_i @ hat_W_i @ A_i.conj().T)
-
-        # log2 det(Ψ^{(n)}_i)
-        _, logdet = np.linalg.slogdet(Psi_i_n)
-        log2_det_Psi_i_n = logdet / np.log(2)
-
-        # A^H · (Ψ^{(n)}_i)^{-1} · A
-        Psi_i_n_inv = np.linalg.inv(Psi_i_n)
-        G_i = A_i.conj().T @ Psi_i_n_inv @ A_i            # (N, N)
-
-        # 常数部分: -ξ1·log2det(Δ) + ξ1·log2det(Ψ) - ξ1ξ2/ln2·Tr(G_i W^{(n)}_i)
-        const_438 = (- xi1 * log2_det_Delta
-                     + xi1 * log2_det_Psi_i_n
-                     - xi1 * xi2 / np.log(2) * np.real(np.trace(G_i @ hat_W_i)))
-
         constraints.append(
-            const_438
-            - var_auxiliary_variable_z[i]
-            + xi1 * xi2 / np.log(2) * cp.real(cp.trace(G_i @ var_uavs_sen_beam[i]))
+            var_cus_off_duration[j]                            # D^off_{c_j}
+            - D_max_cj + eps_strict                            # - D^max_{c_j}
             <= 0
         )
 
-    # ==============================
-    # 约束 (4.39): 对约束 (4.24) 进行 CCCP 线性化（第 n+1 次迭代）,  ∀c_j ∈ C
+    # =========================================================================
+    # 约束 (4.38)：
+    #   Σ_{u_i} f_{u_i} + Σ_{c_j} C_{c_j} L_j / (D^max_{c_j} - D^off_{c_j}) - F^max ≤ 0
+    # =========================================================================
+    sum_freq = cp.sum(var_bs_2_uav_freqs)                      # Σ_{u_i} f_{u_i}
+    for j in range(J):
+        sum_freq = (
+            sum_freq
+            + C_bit                                            # C_{c_j}
+              * cus_entertaining_task_size[j]                  # · L_j
+              * cp.inv_pos(D_max_cj - var_cus_off_duration[j]) # / (D^max_{c_j} - D^off_{c_j})
+        )
+    constraints.append(sum_freq - F_max <= 0)
+
+    # =========================================================================
+    # 约束 (4.42)：对约束 (4.28) 进行 CCCP 线性化（第 n+1 次迭代）
+    #
+    #   - ξ1 · log2det(Δ_i)
+    #   - z_i
+    #   + ξ1 · log2det(Ψ^(n)_i)
+    #   + ξ1 ξ2 / ln2 · Tr( A^H(θ_i) · (Ψ^(n)_i)^{-1} · A(θ_i) · (W_i - W^(n)_i) )
+    #   ≤ 0，∀u_i ∈ U
+    #
+    #   其中 Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
+    # =========================================================================
+    for i in range(I):
+        A_i     = matched_uav_sensing_channel[i]                # A(θ_i)，shape (N, N)
+        Delta_i = Delta_list[i]                                 # Δ_i，shape (N, N)
+        hat_W_i = hat_uav_sen_beams[i]                         # W^(n)_i，shape (N, N)
+
+        # Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
+        Psi_i_n = (Delta_i
+                   + xi2 * (A_i @ hat_W_i @ A_i.conj().T))
+
+        # log2 det(Δ_i)
+        _, logdet_Delta_i = np.linalg.slogdet(Delta_i)
+        log2_det_Delta_i  = logdet_Delta_i / np.log(2)
+
+        # log2 det(Ψ^(n)_i)
+        _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n)
+        log2_det_Psi_i_n  = logdet_Psi_i_n / np.log(2)
+
+        # A^H(θ_i) · (Ψ^(n)_i)^{-1} · A(θ_i)，shape (N, N)
+        Psi_i_n_inv = np.linalg.inv(Psi_i_n)
+        AH_Psiinv_A = A_i.conj().T @ Psi_i_n_inv @ A_i
+
+        constraints.append(
+            - xi1 * log2_det_Delta_i                            # - ξ1 · log2det(Δ_i)
+            - var_auxiliary_variable_z[i]                       # - z_i
+            + xi1 * log2_det_Psi_i_n                           # + ξ1 · log2det(Ψ^(n)_i)
+            + xi1 * xi2 / np.log(2)                            # + ξ1 ξ2 / ln2
+              * cp.real(cp.trace(                               #   · Tr(
+                  AH_Psiinv_A                                   #       A^H (Ψ^(n))^{-1} A
+                  @ (var_uavs_sen_beam[i] - hat_W_i)            #       · (W_i - W^(n)_i)
+              ))                                                #     )
+            <= 0
+        )
+
+    # =========================================================================
+    # 约束 (4.43)：对约束 (4.29) 进行 CCCP 线性化（第 n+1 次迭代）
     #
     #   L_j
-    #   - B·(Σ_i η_{i,j}·D̄_sen)·log2(p_j|h_{c_j,BS}|^2 + Σ_i η_{i,j}·Tr(H_{u_i,BS}·W_i) + σ^2)
-    #   - B·(Σ_i η_{i,j}·D^off_{u_i})·log2(p_j|h_{c_j,BS}|^2 + Σ_i η_{i,j}·Tr(H_{u_i,BS}·B_i) + σ^2)
-    #   - B·(D^off_{c_j} - Σ_i η_{i,j}·D̄_sen - Σ_i η_{i,j}·D^off_{u_i})·log2(1 + p_j|h_{c_j,BS}|^2/σ^2)
-    #   + B·(Σ_i η_{i,j}·D̄_sen)·log2(Ψ^{(n)}_{j,1})
-    #   + B·(Σ_i η_{i,j}·D^off_{u_i})·log2(Ψ^{(n)}_{j,2})
-    #   + B·(Σ_i η_{i,j}·D̄_sen)/(ln2·Ψ^{(n)}_{j,1}) · Σ_i η_{i,j}·Tr(H_{u_i,BS}·(W_i-W^{(n)}_i))
-    #   + B·(Σ_i η_{i,j}·D^off_{u_i})/(ln2·Ψ^{(n)}_{j,2}) · Σ_i η_{i,j}·Tr(H_{u_i,BS}·(B_i-B^{(n)}_i))
-    #   ≤ 0
+    #   - Σ_i η_{i,j} D̄_sen · B · log2( p_j|h_{c_j,BS}|² + Σ_i η_{i,j} Tr(H_{u_i,BS} W_i) + σ² )
+    #   - Σ_i η_{i,j} D^off_{u_i} · B · log2( p_j|h_{c_j,BS}|² + Σ_i η_{i,j} Tr(H_{u_i,BS} B_i) + σ² )
+    #   - ( D^off_{c_j} - Σ_i η_{i,j} D̄_sen - Σ_i η_{i,j} D^off_{u_i} )
+    #     · B · log2( 1 + p_j |h_{c_j,BS}|² / σ² )
+    #   + Σ_i η_{i,j} D̄_sen · B · log2( Ψ^(n)_{j,1} )
+    #   + Σ_i η_{i,j} D^off_{u_i} · B · log2( Ψ^(n)_{j,2} )
+    #   + B · Σ_i η_{i,j} D̄_sen / ( ln2 · Ψ^(n)_{j,1} )
+    #     · Σ_i η_{i,j} Tr( H_{u_i,BS} (W_i - W^(n)_i) )
+    #   + B · Σ_i η_{i,j} D^off_{u_i} / ( ln2 · Ψ^(n)_{j,2} )
+    #     · Σ_i η_{i,j} Tr( H_{u_i,BS} (B_i - B^(n)_i) )
+    #   ≤ 0，∀c_j ∈ C
     #
-    #   其中 Ψ^{(n)}_{j,1} = Σ_i η_{i,j}·Tr(H_{u_i,BS}·W^{(n)}_i) + σ^2
-    #        Ψ^{(n)}_{j,2} = Σ_i η_{i,j}·Tr(H_{u_i,BS}·B^{(n)}_i) + σ^2
-    # ==============================
+    #   其中 Ψ^(n)_{j,1} = Σ_i η_{i,j} Tr(H_{u_i,BS} W^(n)_i) + σ²
+    #        Ψ^(n)_{j,2} = Σ_i η_{i,j} Tr(H_{u_i,BS} B^(n)_i) + σ²
+    # =========================================================================
     for j in range(J):
-        p_j      = cus_off_power[j]
-        h_cj_sq  = cu_ch_gain_sq[j]                       # |h_{c_j,BS}|^2
+        p_j     = cus_off_power[j]                              # p_j
+        h_cj_sq = h_cj_BS_sq[j]                                # |h_{c_j,BS}|²
 
-        # 聚合系数（常数）
-        sum_eta_D_sen = D_sen   * float(np.sum(uavs_cus_matched_matrix[:, j]))
-        sum_eta_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
+        # Σ_i η_{i,j} D̄_sen（常数系数）
+        sum_eta_ij_D_sen = D_sen * float(np.sum(uavs_cus_matched_matrix[:, j]))
+        # Σ_i η_{i,j} D^off_{u_i}（常数系数）
+        sum_eta_ij_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
 
-        # log2(1 + p_j|h|^2/σ^2) — 常数
-        log2_cu_snr = np.log2(1.0 + p_j * h_cj_sq / noise_power)
+        # log2(1 + p_j |h_{c_j,BS}|² / σ²)（常数）
+        log2_cu_snr = np.log2(1.0 + p_j * h_cj_sq / sigma_2)
 
-        # ---------- 预计算 Ψ^{(n)}_{j,1} 和 Ψ^{(n)}_{j,2} ----------
-        Psi_j1_n = noise_power
-        Psi_j2_n = noise_power
+        # ── 预计算 Ψ^(n)_{j,1} 和 Ψ^(n)_{j,2}（常数）────────────────────────
+        # Ψ^(n)_{j,1} = Σ_i η_{i,j} Tr(H_{u_i,BS} W^(n)_i) + σ²
+        Psi_j1_n = sigma_2                                      # 初始化为 σ²
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]              # η_{i,j}
+            if eta_ij > 0:
+                Psi_j1_n += (
+                    eta_ij                                       # η_{i,j}
+                    * float(np.real(np.trace(
+                        H_ui_BS_list[i] @ hat_uav_sen_beams[i]  # Tr(H_{u_i,BS} W^(n)_i)
+                    )))
+                )
+
+        # Ψ^(n)_{j,2} = Σ_i η_{i,j} Tr(H_{u_i,BS} B^(n)_i) + σ²
+        Psi_j2_n = sigma_2                                      # 初始化为 σ²
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]              # η_{i,j}
+            if eta_ij > 0:
+                Psi_j2_n += (
+                    eta_ij                                       # η_{i,j}
+                    * float(np.real(np.trace(
+                        H_ui_BS_list[i] @ hat_uav_off_beams[i]  # Tr(H_{u_i,BS} B^(n)_i)
+                    )))
+                )
+
+        # ── 构建含优化变量的 CVXPY 表达式 ────────────────────────────────────
+        # Σ_i η_{i,j} Tr(H_{u_i,BS} W_i)（含优化变量，用于 log 的参数）
+        sum_eta_tr_H_W = 0.0
         for i in range(I):
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
-                Psi_j1_n += eta_ij * np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i]))
-                Psi_j2_n += eta_ij * np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i]))
+                sum_eta_tr_H_W = (
+                    sum_eta_tr_H_W
+                    + eta_ij                                     # η_{i,j}
+                    * cp.real(cp.trace(                          # · Tr(H_{u_i,BS} W_i)
+                        H_ui_BS_list[i] @ var_uavs_sen_beam[i]
+                    ))
+                )
 
-        # ---------- 构建 CVXPY 变量表达式 ----------
-        # arg_W = p_j|h|^2 + Σ_i η_{i,j} Tr(H_{u_i,BS} W_i) + σ^2
-        # arg_B = p_j|h|^2 + Σ_i η_{i,j} Tr(H_{u_i,BS} B_i) + σ^2
-        arg_W = p_j * h_cj_sq + noise_power   # 从常数开始累加
-        arg_B = p_j * h_cj_sq + noise_power
-        # grad_W_expr = Σ_i η_{i,j} Tr(H_{u_i,BS} (W_i - W^{(n)}_i))
-        # grad_B_expr = Σ_i η_{i,j} Tr(H_{u_i,BS} (B_i - B^{(n)}_i))
-        grad_W_expr = 0.0
-        grad_B_expr = 0.0
-
+        # Σ_i η_{i,j} Tr(H_{u_i,BS} B_i)（含优化变量，用于 log 的参数）
+        sum_eta_tr_H_B = 0.0
         for i in range(I):
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
-                H_i          = H_ui_BS_list[i]
-                tr_H_Wi      = cp.real(cp.trace(H_i @ var_uavs_sen_beam[i]))
-                tr_H_Bi      = cp.real(cp.trace(H_i @ var_uavs_off_beam[i]))
-                tr_H_hatWi   = float(np.real(np.trace(H_i @ hat_uav_sen_beams[i])))
-                tr_H_hatBi   = float(np.real(np.trace(H_i @ hat_uav_off_beams[i])))
+                sum_eta_tr_H_B = (
+                    sum_eta_tr_H_B
+                    + eta_ij                                     # η_{i,j}
+                    * cp.real(cp.trace(                          # · Tr(H_{u_i,BS} B_i)
+                        H_ui_BS_list[i] @ var_uavs_off_beam[i]
+                    ))
+                )
 
-                arg_W      = arg_W      + eta_ij * tr_H_Wi
-                arg_B      = arg_B      + eta_ij * tr_H_Bi
-                grad_W_expr = grad_W_expr + eta_ij * (tr_H_Wi - tr_H_hatWi)
-                grad_B_expr = grad_B_expr + eta_ij * (tr_H_Bi - tr_H_hatBi)
+        # Σ_i η_{i,j} Tr(H_{u_i,BS} (W_i - W^(n)_i))（梯度修正，含优化变量）
+        sum_eta_tr_H_dW = 0.0
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                tr_H_Wi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_sen_beam[i]))
+                tr_H_hatWi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i])))
+                sum_eta_tr_H_dW = (
+                    sum_eta_tr_H_dW
+                    + eta_ij * (tr_H_Wi - tr_H_hatWi)           # η_{i,j} Tr(H (W_i - W^(n)_i))
+                )
 
-        # ---------- 组装线性化约束 ----------
-        # 凸项：-B · coeff · log2(arg)，用 cp.log() 表示
-        if sum_eta_D_sen > 0:
-            term_W_log = -B * sum_eta_D_sen * cp.log(arg_W) / np.log(2)
+        # Σ_i η_{i,j} Tr(H_{u_i,BS} (B_i - B^(n)_i))（梯度修正，含优化变量）
+        sum_eta_tr_H_dB = 0.0
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                tr_H_Bi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_off_beam[i]))
+                tr_H_hatBi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i])))
+                sum_eta_tr_H_dB = (
+                    sum_eta_tr_H_dB
+                    + eta_ij * (tr_H_Bi - tr_H_hatBi)           # η_{i,j} Tr(H (B_i - B^(n)_i))
+                )
+
+        # ── 逐项构建约束 (4.39) ───────────────────────────────────────────────
+
+        # 项①：- Σ_i η_{i,j} D̄_sen · B · log2( p_j|h|² + Σ_i η Tr(H W_i) + σ² )
+        if sum_eta_ij_D_sen > 0:
+            term_1 = (
+                - sum_eta_ij_D_sen * B                          # - Σ_i η_{i,j} D̄_sen · B
+                * cp.log(                                        # · log(
+                    p_j * h_cj_sq                               #     p_j |h_{c_j,BS}|²
+                    + sum_eta_tr_H_W                            #   + Σ_i η Tr(H_{u_i,BS} W_i)
+                    + sigma_2                                    #   + σ²
+                ) / np.log(2)
+            )
         else:
-            term_W_log = 0.0
+            term_1 = 0.0
 
-        if sum_eta_D_off > 0:
-            term_B_log = -B * sum_eta_D_off * cp.log(arg_B) / np.log(2)
+        # 项②：- Σ_i η_{i,j} D^off_{u_i} · B · log2( p_j|h|² + Σ_i η Tr(H B_i) + σ² )
+        if sum_eta_ij_D_off > 0:
+            term_2 = (
+                - sum_eta_ij_D_off * B                          # - Σ_i η_{i,j} D^off_{u_i} · B
+                * cp.log(                                        # · log(
+                    p_j * h_cj_sq                               #     p_j |h_{c_j,BS}|²
+                    + sum_eta_tr_H_B                            #   + Σ_i η Tr(H_{u_i,BS} B_i)
+                    + sigma_2                                    #   + σ²
+                ) / np.log(2)
+            )
         else:
-            term_B_log = 0.0
+            term_2 = 0.0
 
-        # 含变量 D^off_{c_j} 的线性项
-        term_Dcj = -B * (var_cus_off_duration[j] - sum_eta_D_sen - sum_eta_D_off) * log2_cu_snr
+        # 项③：- ( D^off_{c_j} - Σ_i η D̄_sen - Σ_i η D^off_{u_i} ) · B · log2(1 + p_j|h|²/σ²)
+        term_3 = (
+            - (var_cus_off_duration[j]                          # -( D^off_{c_j}
+               - sum_eta_ij_D_sen                               #    - Σ_i η_{i,j} D̄_sen
+               - sum_eta_ij_D_off)                              #    - Σ_i η_{i,j} D^off_{u_i} )
+            * B * log2_cu_snr                                   # · B · log2(1 + p_j|h|²/σ²)
+        )
 
-        # 线性化 ℱ^‡_2 的常数部分
-        psi_const = (B * sum_eta_D_sen * np.log2(Psi_j1_n)
-                     + B * sum_eta_D_off * np.log2(Psi_j2_n))
+        # 项④：+ Σ_i η D̄_sen · B · log2(Ψ^(n)_{j,1})（常数）
+        term_4 = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n)      # Σ_i η D̄_sen · B · log2(Ψ^(n)_{j,1})
 
-        # 梯度修正项
-        if sum_eta_D_sen > 0 and not isinstance(grad_W_expr, float):
-            grad_W_full = B * sum_eta_D_sen / (np.log(2) * Psi_j1_n) * grad_W_expr
+        # 项⑤：+ Σ_i η D^off_{u_i} · B · log2(Ψ^(n)_{j,2})（常数）
+        term_5 = sum_eta_ij_D_off * B * np.log2(Psi_j2_n)      # Σ_i η D^off · B · log2(Ψ^(n)_{j,2})
+
+        # 项⑥：+ B · Σ_i η D̄_sen / (ln2 · Ψ^(n)_{j,1}) · Σ_i η Tr(H (W_i - W^(n)_i))
+        if sum_eta_ij_D_sen > 0 and not isinstance(sum_eta_tr_H_dW, float):
+            term_6 = (
+                B * sum_eta_ij_D_sen                            # B · Σ_i η_{i,j} D̄_sen
+                / (np.log(2) * Psi_j1_n)                       # / (ln2 · Ψ^(n)_{j,1})
+                * sum_eta_tr_H_dW                               # · Σ_i η Tr(H (W_i - W^(n)_i))
+            )
         else:
-            grad_W_full = 0.0
+            term_6 = 0.0
 
-        if sum_eta_D_off > 0 and not isinstance(grad_B_expr, float):
-            grad_B_full = B * sum_eta_D_off / (np.log(2) * Psi_j2_n) * grad_B_expr
+        # 项⑦：+ B · Σ_i η D^off_{u_i} / (ln2 · Ψ^(n)_{j,2}) · Σ_i η Tr(H (B_i - B^(n)_i))
+        if sum_eta_ij_D_off > 0 and not isinstance(sum_eta_tr_H_dB, float):
+            term_7 = (
+                B * sum_eta_ij_D_off                            # B · Σ_i η_{i,j} D^off_{u_i}
+                / (np.log(2) * Psi_j2_n)                       # / (ln2 · Ψ^(n)_{j,2})
+                * sum_eta_tr_H_dB                               # · Σ_i η Tr(H (B_i - B^(n)_i))
+            )
         else:
-            grad_B_full = 0.0
+            term_7 = 0.0
 
         constraints.append(
-            cus_entertaining_task_size[j]
-            + term_W_log
-            + term_B_log
-            + term_Dcj
-            + psi_const
-            + grad_W_full
-            + grad_B_full
+            cus_entertaining_task_size[j]                       # L_j
+            + term_1                                            # 项①
+            + term_2                                            # 项②
+            + term_3                                            # 项③
+            + term_4                                            # 项④
+            + term_5                                            # 项⑤
+            + term_6                                            # 项⑥
+            + term_7                                            # 项⑦
             <= 0
         )
 
-    # ==============================
-    # var 变量的基本非负约束
-    # ==============================
-    # f_{u_i} ≥ 0
-    constraints.append(var_bs_2_uav_freqs >= 0)
-    # z_i ≥ 0
-    constraints.append(var_auxiliary_variable_z >= 0)
-    # D^off_{c_j} ≥ 0
-    constraints.append(var_cus_off_duration >= 0)
+    # =========================================================================
+    # 变量非负约束
+    # =========================================================================
+    constraints.append(var_bs_2_uav_freqs >= 0)                # f_{u_i} ≥ 0
+    constraints.append(var_auxiliary_variable_z >= 0)           # z_i ≥ 0
+    constraints.append(var_cus_off_duration >= 0)               # D^off_{c_j} ≥ 0
 
     return constraints
 
@@ -908,19 +1038,22 @@ def penalty_based_cccp(args,
                                   cur_penalty_factor = cur_penalty_factor
                                   )
         # 定义约束
-        constraints = define_constraint(args = args,
+        constraints = define_constraint(args=args,
                                         var_uavs_sen_beam=var_uavs_sen_beam,
                                         var_uavs_off_beam=var_uavs_off_beam,
                                         var_bs_2_uav_freqs=var_bs_2_uav_freqs,
                                         var_auxiliary_variable_z=var_auxiliary_variable_z,
                                         var_cus_off_duration=var_cus_off_duration,
-                                        hat_auxiliary_variable_z=hat_auxiliary_variable_z,
-                                        hat_bs_2_uav_freqs=hat_bs_2_uav_freqs,
                                         hat_uav_sen_beams=hat_uav_sen_beams,
                                         hat_uav_off_beams=hat_uav_off_beams,
                                         cus_entertaining_task_size=cus_entertaining_task_size,
                                         uavs_off_duration=uavs_off_duration,
                                         cus_off_power=cus_off_power,
+                                        matched_uav_sensing_channel=matched_uav_sensing_channel,
+                                        uavs_2_cus_channels=uavs_2_cus_channels,
+                                        uavs_2_bs_channels=uavs_2_bs_channels,
+                                        cus_2_bs_channels=cus_2_bs_channels,
+                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix
                                         )
         # 创建并求解
         problem = cp.Problem(cp.Minimize(obj_fun), constraints)
