@@ -36,7 +36,7 @@ def get_base_args():
     base_parser.add_argument("--bandwidth", type=float, default=10e6, help="带宽 (Hz)")
 
     # 算法/物理参数
-    base_parser.add_argument("--uav_c1", type=float, default=0.0661, help="UAV 飞行参数 c1")
+    base_parser.add_argument("--uav_c1", type=float, default=0.00614, help="UAV 飞行参数 c1")
     base_parser.add_argument("--uav_c2", type=float, default=15.976, help="UAV 飞行参数 c2")
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
     base_parser.add_argument("--bs_max_freq", type=float, default=20e9, help="BS 最大工作频率 (Hz)")
@@ -44,12 +44,13 @@ def get_base_args():
     base_parser.add_argument("--time_slot_duration", type=float, default=0.5, help="时隙长度 (s)")
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
     base_parser.add_argument("--cu_max_power_dbm", type=float, default=23, help="CU 最大发射功率 (dBm)")
-    base_parser.add_argument("--uav_max_power", type=float, default=1.0, help="UAV 最大功率 (W)")
+    base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
     base_parser.add_argument("--cu_max_delay", type=float, default=0.5, help="娱乐任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_speed", type=float, default=40.0, help="UAV 最大移动速度 (m/s)")
+    base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
-    base_parser.add_argument("--sen_sinr", type=float, default=10, help="感知门限阈值 (dB)")
+    base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
+    base_parser.add_argument("--sen_sinr", type=float, default=2, help="感知门限阈值 (dB)")
 
     # 权重参数
     base_parser.add_argument("--omega_weight_1", type=float, default=0.2, help="BS 权重")
@@ -67,8 +68,8 @@ def get_base_args():
     base_parser.add_argument("--cccp_threshold", type=float, default=1e-5, help="CCCP 算法收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1e-1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
-    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.39,4.40,auxiliary_t", help="启用约束组，逗号分隔")
-    base_parser.add_argument("--constraint_exclude_groups", type=str, default="4.44,4.45", help="禁用约束组，逗号分隔")
+    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32, 4.39,4.40, 4.44, 4.45, auxiliary_t", help="启用约束组，逗号分隔")
+    base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
     return base_parser.parse_args()
 
@@ -561,7 +562,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     #
     # Δ_i = Σ_{j=1}^{J} η_{i,j} · p_j · h_{u_i,c_j} · h^H_{u_i,c_j} + σ² I_N
     #
-    # uavs_2_cus_channels shape: (I, J, N)，其中第三维为 UAV 天线方向
+    # uavs_2_cus_channels shape: (I, J, N)，其中第三维为 UAV 天线个数 N
     Delta_list = []
     for i in range(I):
         Delta_i = sigma_2 * np.eye(N, dtype=complex)           # σ² I_N
@@ -953,11 +954,17 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
 
 
 def parse_group_list(group_text):
+    """
+    解析约束组列表字符串，返回约束组名称列表。
+    约束组名称列表中的每个元素为一个字符串，代表一个约束组。
+    约束组名称列表中的元素顺序与约束组在问题 P6 中的顺序一致。
+    """
     if group_text is None:
         return None
     group_text = str(group_text).strip()
     if group_text == "":
         return None
+    # 以","进行输入故以逗号进行分割
     return [item.strip() for item in group_text.split(",") if item.strip()]
 
 
@@ -1011,6 +1018,27 @@ def select_constraints(constraint_map, include_groups=None, exclude_groups=None)
     return selected_constraints, active_groups
 
 
+def probe_group_feasibility(constraint_map, active_groups, solver):
+    """
+    问题的可行性检验
+    
+    :param constraint_map: 约束组 map 集合，key 为约束组名称，value 为约束列表
+    :param active_groups: 活动约束组名称列表
+    :param solver: 优化求解器
+    :return: 每个约束组的可行性检验结果列表，每个元素为 (约束组名称, 求解状态)
+    """
+    cumulative_constraints = []
+    probe_rows = []
+    for group in active_groups:
+        cumulative_constraints.extend(constraint_map[group])
+        probe_problem = cp.Problem(cp.Minimize(0), cumulative_constraints)
+        probe_problem.solve(solver=solver, warm_start=False)
+        probe_rows.append((group, probe_problem.status))
+        if probe_problem.status in ("infeasible", "infeasible_inaccurate"):
+            break
+    return probe_rows
+
+
 def penalty_based_cccp(args,
                        uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
                        uavs_targets_matched_matrix, uavs_cus_matched_matrix,
@@ -1020,14 +1048,16 @@ def penalty_based_cccp(args,
     基于惩罚的 CCCP 算法
     
     :param args: 包含所有基础参数的命名空间
-    :param uavs_2_cus_channels: UAVs 到 CUs 的信道响应矩阵 (I * J * N * N)
-    :param uavs_2_bs_channels: UAVs 到 BS 的信道响应矩阵 (I * 1 * N)
-    :param cus_2_bs_channels: CUs 到 BS 的信道响应矩阵 (J * 1)
-    :param uavs_2_targets_channels: UAVs 到 targets 的信道响应矩阵 (I * K * N * N)
-    :param uavs_targets_matched_matrix: UAVs 和 targets 的匹配矩阵 (I * K) 
-    :param uavs_cus_matched_matrix: UAVs 和 CUs 的匹配矩阵 (I * J) (DRL 输出)
-    :param uavs_pos_pre: UAVs 前一时刻位置 (I * 3)
-    :param uavs_pos_cur: UAVs 当前时刻位置 (I * 3)
+    :param uavs_2_cus_channels: UAVs 到 CUs 的信道响应矩阵 (维度: I * J * N * N)
+    :param uavs_2_bs_channels: UAVs 到 BS 的信道响应矩阵 (维度: I * 1 * N)
+    :param cus_2_bs_channels: CUs 到 BS 的信道响应矩阵 (维度: J * 1)
+    :param uavs_2_targets_channels: UAVs 到 targets 的信道响应矩阵 (维度: I * K * N * N)
+    :param uavs_targets_matched_matrix: UAVs 和 targets 的匹配矩阵 (维度: I * K) 
+    :param uavs_cus_matched_matrix: UAVs 和 CUs 的匹配矩阵 (维度: I * J) (DRL 输出)
+    :param uavs_pos_pre: UAVs 前一时刻位置 (维度: I * 3) (DRL 输出)
+    :param uavs_pos_cur: UAVs 当前时刻位置 (维度: I * 3) (DRL 输出)
+    :param uavs_off_duration: UAVs 感知任务卸载时长 (维度: I) (DRL 输出)
+    :param cus_off_power: CUs 娱乐任务卸载功率 (维度: J) (DRL 输出)
     :return: 目标函数总延迟
     """
     # 定义 CU 的娱乐任务量大小
@@ -1064,6 +1094,7 @@ def penalty_based_cccp(args,
     print(f"-------------------- CCCP算法开始迭代 -------------------- ")
     print("-------------------------------------------------------- ")
     iter_count = 0  # 记录迭代次数
+    infeasible_probe_done = False
 
     for iter in range(args.max_iterations):
         # 定义目标函数
@@ -1116,9 +1147,18 @@ def penalty_based_cccp(args,
         problem.solve(solver=cp.SCS, warm_start=True)
 
         print("status:", problem.status)
-        # 如果优化器此时处理结果是 infeasible 
-        if problem.status == 'infeasible':
-            # 逐条约束检查
+        # 如果优化器此时处理结果是 infeasible : 判断是哪个约束导致
+        if problem.status in ("infeasible", "infeasible_inaccurate"):
+            print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
+            if not infeasible_probe_done:
+                infeasible_probe_done = True
+                rows = probe_group_feasibility(constraint_map, active_groups, cp.SCS)
+                print("分组可行性探测结果:")
+                for group, status in rows:
+                    print(f"  + {group}: {status}")
+            iter_count = iter + 1
+            break
+        elif problem.status in ("optimal", "optimal_inaccurate"):
             for k, con in enumerate(constraints):
                 try:
                     val = con.violation()
