@@ -3,6 +3,26 @@ from gym import spaces
 import numpy as np
 
 
+def dbm_2_watt(dbm):
+    """
+    将 dBm 转换为瓦特
+
+    :param dbm: 功率值（dBm）
+    :return: 功率值（瓦特）
+    """
+    return 10 ** ((dbm - 30) / 10)
+
+
+def db_2_watt(db):
+    """
+    将 dB 转换为瓦特
+
+    :param db: 功率值（dB）
+    :return: 功率值（瓦特）
+    """
+    return 10 ** (db / 10)
+
+
 class MyEnv(gym.Env):
     """
     通信系统优化自定义环境
@@ -18,38 +38,82 @@ class MyEnv(gym.Env):
         # 获取仿真参数设定
         self.base_args = base_args
         self.madrl_args = madrl_args
+        # 初始化位置
+        self.uavs_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.uavs_num, 3), dtype=float)
+        self.cus_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 3), dtype=float)
+        self.targets_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.targets_num, 3), dtype=float)
+        self.precomputed_cus_traj = generate_cu_trajectory()  # 提前生成的 CU 轨迹
         
-        # --- 动作空间定义 (Action Space) ---
-        # 混合动作空间 (Hybrid Action Space):
-        # 1. 连续动作: 发射功率, 波束赋形权重 (由 Agent 的 Beta 分布输出)
-        # 2. 离散动作: UAV 复用 CU 的频谱资源选择系数
+        #  动作空间定义 
+        self.action_space = {}
+        self.epsilon = 1e-8
         
-        # 示例维度 (需根据具体场景调整):
-        # 连续动作: [Power_UAV, Phase_Shifts...]
-        self.cont_action_dim = self.num_uavs * 2  # 占位符维度
-        
-        # 离散动作: 选择索引 (例如选择哪个 CU 进行复用)
-        self.discrete_action_dim = self.num_users  # 假设选择一个 CU
-        
-        # 定义 Gym 空间
-        # 注意: 虽然 Gym 支持 Tuple 或 Dict，但为了兼容性，通常需要 Agent 做适配
-        self.action_space = spaces.Dict({
-            "continuous": spaces.Box(low=0, high=1, shape=(self.cont_action_dim,), dtype=np.float32),
-            "discrete": spaces.Discrete(self.discrete_action_dim)
-        })
+        #  每个UAV单独动作空间
+        #  1. UAV 飞行角度 [0, 2π]
+        #  2. UAV 飞行距离 [min_dist, max_dist]
+        #  3. 感知任务卸载时长 [epsilon, max_delay - sen_duration]
+        #  4. 频谱共享系数 (J维) [0, 1]
+        self.action_space["uav"] = {
+            f"uav_{i}": spaces.Dict({
+                # 连续动作：方向角、移动距离、感知延迟
+                "uav_action_continuous": spaces.Box(
+                    low=np.array([
+                        0,
+                        self.base_args.uav_min_speed * self.base_args.time_slot_duration,
+                        self.epsilon
+                    ], dtype=np.float32),
+                    high=np.array([
+                        2 * np.pi,
+                        self.base_args.uav_max_speed * self.base_args.time_slot_duration,
+                        self.base_args.uav_max_delay - self.base_args.uav_sen_duration
+                    ], dtype=np.float32),
+                    dtype=np.float32
+                ),
+                # 离散动作：选择复用频谱 CU 索引 (0 ~ cus_num-1)
+                "uav_action_discrete": spaces.Discrete(self.base_args.cus_num)
+            })
+            for i in range(self.base_args.uavs_num)
+        }
 
-        # --- 观测空间定义 (Observation Space) ---
-        # 示例: 信道增益, 干扰, 队列状态, UAV 位置
-        self.obs_dim = self.num_users * self.num_bs + self.num_uavs * 3 # 占位符维度
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
+        # BS 动作空间
+        # CU 的发射功率
+        # BS 动作空间
+        self.action_space["bs"] = spaces.Box(
+            low=np.full(self.base_args.cus_num, self.epsilon, dtype=np.float32),
+            high=np.full(self.base_args.cus_num, dbm_2_watt(self.base_args.cu_max_power_dbm), dtype=np.float32),
+            dtype=np.float32
+        )
 
-        # --- 奖励接口 ---
-        # self.reward_calculator = MyReward() 
+        # 观测空间定义
+        self.observation_space = {}
+
+        # UAV 观测空间
+        # 1. UAV i 的坐标
+        # 3. CU <==> UAV 信道
+        # 4. UAV <==> BS 的信道
+        self.observation_space["uav"] = {
+            f"uav_{i}": spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(3 +
+                       self.base_args.uavs_num * self.base_args.cus_num +
+                       1,),
+                dtype=np.float32
+            )
+            for i in range(self.base_args.uavs_num)
+        }
+
+        # BS 观测空间
+        # 1. CU <=> BS 信道
+        self.observation_space["bs"] = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.base_args.cus_num),
+            dtype=np.float32
+        )
+
+        self.reward = MyReward() # 初始化奖励类
         
-        # --- 内部状态 ---
-        self.state = None
-        self.steps = 0
-        self.max_steps = 50
+        self.t = 0  # 初始时隙 index 为 0 
+
 
     def reset(self):
         """
@@ -62,6 +126,7 @@ class MyEnv(gym.Env):
         self.state = np.zeros(self.obs_dim) 
         
         return self._get_obs()
+
 
     def step(self, action):
         """
@@ -105,6 +170,7 @@ class MyEnv(gym.Env):
         
         return next_obs, reward, done, info
 
+
     def _get_obs(self):
         """
         构建观测向量
@@ -115,12 +181,14 @@ class MyEnv(gym.Env):
         # 进行必要的归一化
         return self.state
 
+
     def render(self, mode='human'):
         """
         可视化环境
         """
         print(f"Step: {self.steps}, State: {self.state}")
     
+
     def generate_pos(self, uavs_num, cus_num, targets_num, center, radius, uav_height):
         """
         根据圆心和半径生成 UAVs、CUs 和 targets 的随机位置
@@ -156,8 +224,11 @@ class MyEnv(gym.Env):
         targets_pos[:, 0] = center[0] + r_target * np.cos(theta_target)
         targets_pos[:, 1] = center[1] + r_target * np.sin(theta_target)
         # targets_pos[:, 2] = 0  # 默认为 0
-
+        self.uavs_pos = uavs_pos
+        self.cus_pos = cus_pos
+        self.targets_pos = targets_pos
         return uavs_pos, cus_pos, targets_pos
+
 
     def compute_com_channel_gain(self, uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, alpha_uav_link, alpha_cu_link, rician_factor, antenna_nums):
         """
@@ -231,6 +302,7 @@ class MyEnv(gym.Env):
 
         return uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels
 
+
     def compute_sen_channel_gain(self, radar_rcs, frac_d_lambda, uavs_pos, targets_pos, antenna_nums, ref_path_loss):
         """
         根据雷达截面积、天线间距与波长的比例，UAVs 的位置和 targets 的位置计算 UAVs 与 targets 之间的信道响应矩阵
@@ -282,6 +354,7 @@ class MyEnv(gym.Env):
         
         return uavs_2_targets_channels
 
+
     def match_uav_targets_nearest(self, uavs_pos, targets_pos):
         """
         根据距离最近原则，对 UAVs 和 targets 进行一一匹配
@@ -306,3 +379,57 @@ class MyEnv(gym.Env):
         uavs_targets_matched_matrix[row_ind, col_ind] = 1
         
         return uavs_targets_matched_matrix
+
+
+    def generate_cu_trajectory(self):
+        """
+        Gauss-Markov 模型轨迹
+        """
+        traj = np.zeros((self.total_time_slots, self.base_args.cus_num, 3), dtype=float)
+        # 使用二维向量表示速度，因为用户在地面移动
+        velocities = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 2), dtype=float)
+
+        # 初始化起始位置和速度
+        traj[0] = self.cus_pos.copy()
+        velocities[0] = np.tile(self.args.markov_velocity, (self.base_args.cus_num, 1))
+
+        # 循环为所有时间片生成轨迹
+        for t in range(self.madrl_args.total_time_slots - 1):
+            # 为所有用户生成随机分量
+            # 对应于 Gauss-Markov 模型中的随机过程 w_k[n]
+            random_component = self.rng.normal(size=(self.base_args.cus_num, 2))
+
+            # 根据高斯-马尔可夫模型方程更新速度:
+            # v_k[n+1] = α*v_k[n] + (1-α)*v_bar + sqrt(1-α^2)*σ_bar*w_k[n]
+            velocities[t + 1] = (self.base_args.markov_memory_level * velocities[t] +  
+                                 (1 - self.base_args.markov_memory_level) * self.base_args.markov_asymptotic_mean_of_velocity +  
+                                 np.sqrt(1 - self.base_args.markov_memory_level ** 2) * self.base_args.markov_standard_deviation_of_velocity * random_component)  
+
+            # 根据上一个时间片的速度更新位置: p_k[n+1] = p_k[n] + v_k[n]*Δt
+            # traj[t, :, :2]: p_k[n] (当前位置)
+            # velocities[t]: v_k[n] (当前速度)
+            # self.tau: Δt (时间片时长)
+            traj[t + 1, :, :2] = traj[t, :, :2] + velocities[t] * self.time_slot_duration
+
+            # 保持z坐标不变，因为用户在地面上
+            traj[t + 1, :, 2] = traj[t, :, 2]
+
+        return traj
+
+
+    def update_cus_pos(self):
+        """
+        用户移动：直接取预生成轨迹
+            如果用户移动超出边界 则拉回边界
+        """
+        self.cus_pos = self.precomputed_cus_traj[self.t]
+        # 限制用户在给定圆形区域内
+        for i in range(self.cus_pos.shape[0]):
+            pos_2d = self.cus_pos[i, :2]  # 只取 x, y
+            vec = pos_2d - [0, 0]
+            dist = np.linalg.norm(vec)
+            if dist > self.base_args.radius:
+                # 拉回边界点
+                clipped = self.base_args.center + vec / dist * self.base_args.radius
+                self.cus_pos[i, 0] = clipped[0]
+                self.cus_pos[i, 1] = clipped[1]
