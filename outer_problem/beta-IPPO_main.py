@@ -8,6 +8,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from my_env import MyEnv
 import warnings
+import argparse
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from utils.normalization import Normalization, RewardScaling
@@ -15,138 +16,15 @@ from IPPO_agent import IPPO, orthogonal_init
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
+from math import pi, sqrt # 2026-03-16: Added math imports for radar parameters
+
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-# ==========================================
-# Task 2: Hybrid Action Space Support
-# ==========================================
-
-class HybridDistribution:
-    """
-    Custom Distribution for Hybrid Action Space (Continuous + Discrete)
-    """
-    def __init__(self, alpha, beta, discrete_logits):
-        self.cont_dist = Beta(alpha, beta)
-        self.disc_dist = Categorical(logits=discrete_logits)
-
-    def sample(self):
-        # Sample from both distributions
-        a_cont = self.cont_dist.sample()
-        a_disc = self.disc_dist.sample()
-        
-        # a_disc is (batch,), unsqueeze to (batch, 1) for concatenation
-        a_disc = a_disc.unsqueeze(-1).float()
-        
-        # Concatenate: [continuous_actions, discrete_action]
-        return torch.cat([a_cont, a_disc], dim=-1)
-
-    def log_prob(self, action):
-        """
-        Calculate log_prob for hybrid action.
-        Args:
-            action: (batch, cont_dim + 1) tensor
-        Returns:
-            log_prob: (batch, 2) tensor where [:, 0] is cont_log_prob, [:, 1] is disc_log_prob
-        """
-        # Split action into continuous and discrete parts
-        a_cont = action[:, :-1]
-        a_disc = action[:, -1].long()
-        
-        # Calculate log_probs
-        # Sum continuous log_prob over dimensions (assuming independent)
-        log_prob_cont = self.cont_dist.log_prob(a_cont).sum(dim=-1, keepdim=True)
-        
-        # Discrete log_prob
-        log_prob_disc = self.disc_dist.log_prob(a_disc).unsqueeze(-1)
-        
-        # Return concatenated log_probs to be summed by IPPO.update (which uses sum(dim=1))
-        return torch.cat([log_prob_cont, log_prob_disc], dim=-1)
-
-    def entropy(self):
-        # Sum of entropies
-        ent_cont = self.cont_dist.entropy().sum(dim=-1, keepdim=True)
-        ent_disc = self.disc_dist.entropy().unsqueeze(-1)
-        return ent_cont + ent_disc
-
-
-class Actor_Hybrid(nn.Module):
-    """
-    Actor Network for Hybrid Action Space
-    """
-    def __init__(self, state_dim, hidden_dim, action_dim_cont, action_dim_disc, device):
-        super(Actor_Hybrid, self).__init__()
-        # Shared Feature Extractor
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Continuous Action Head (Beta Distribution)
-        self.alpha_layer = nn.Linear(hidden_dim, action_dim_cont)
-        self.beta_layer = nn.Linear(hidden_dim, action_dim_cont)
-        
-        # Discrete Action Head (Categorical Distribution)
-        self.discrete_layer = nn.Linear(hidden_dim, action_dim_disc)
-        
-        self.activate_func = nn.Tanh()
-        self.device = device
-        
-        # Initialization
-        orthogonal_init(self.fc1)
-        orthogonal_init(self.fc2)
-        orthogonal_init(self.alpha_layer, gain=0.01)
-        orthogonal_init(self.beta_layer, gain=0.01)
-        orthogonal_init(self.discrete_layer, gain=0.01)
-
-    def forward(self, s):
-        s = self.activate_func(self.fc1(s))
-        s = self.activate_func(self.fc2(s))
-        
-        # Continuous parameters (Beta: alpha > 1, beta > 1)
-        alpha = F.softplus(self.alpha_layer(s)) + 1.0
-        beta = F.softplus(self.beta_layer(s)) + 1.0
-        
-        # Discrete parameters (Logits)
-        discrete_logits = self.discrete_layer(s)
-        
-        return alpha, beta, discrete_logits
-
-    def get_dist(self, s):
-        alpha, beta, discrete_logits = self.forward(s)
-        return HybridDistribution(alpha, beta, discrete_logits)
-
-
-class IPPO_Hybrid(IPPO):
-    """
-    IPPO Agent adapted for Hybrid Action Space
-    """
-    def __init__(self, state_dim, hidden_dim, action_dim_cont, action_dim_disc, 
-                 actor_lr, critic_lr, lmbda, eps, gamma, epochs, num_episodes, device):
-        # Initialize parent to set basic params, but we will overwrite actor
-        # Passing dummy action dims to parent as we handle them manually
-        super().__init__(state_dim, hidden_dim, action_dim_cont, np.zeros(1), np.zeros(1),
-                         actor_lr, critic_lr, lmbda, eps, gamma, epochs, num_episodes, device, policy_dist="Beta")
-        
-        # Overwrite Actor with Hybrid Actor
-        self.actor = Actor_Hybrid(state_dim, hidden_dim, action_dim_cont, action_dim_disc, device).to(device)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
-        
-        # Critic remains the same (State Value Function)
-        
-    def choose_action(self, s):
-        s = torch.tensor(s, dtype=torch.float).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            dist = self.actor.get_dist(s)
-            a = dist.sample()
-            # log_prob from HybridDistribution is (batch, 2), sum to get total log_prob
-            a_logprob = dist.log_prob(a).sum(dim=-1, keepdim=True)
-            
-            return a.squeeze(0).cpu().numpy(), a_logprob.squeeze(0).cpu().numpy()
-
 
 def setSeed(seed):
     """
     设置随机种子，确保仿真可复现
     """
-    seed = 42
     # Python 内置随机
     random.seed(seed)
     # NumPy 随机
@@ -167,17 +45,26 @@ def get_tensorboard_writer(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     return SummaryWriter(log_dir=log_dir)
 
+def db_2_watt(db):
+    """
+    将 dB 转换为瓦特
+    :param db: 功率值（dB）
+    :return: 功率值（瓦特）
+    """
+    return 10 ** (db / 10)
 
 def get_madrl_args():
     madrl_parser = argparse.ArgumentParser(description="MADRL 超参数")
-    madrl_parser.add_argument("--actor_lr", type=int, default=3e-4, help="actor 学习率")
-    madrl_parser.add_argument("--critic_lr", type=int, default=3e-4, help="critic 学习率")
+    madrl_parser.add_argument("--actor_lr", type=float, default=3e-4, help="actor 学习率") # Changed to float
+    madrl_parser.add_argument("--critic_lr", type=float, default=3e-4, help="critic 学习率") # Changed to float
     madrl_parser.add_argument("--lmbda", type=float, default=0.95, help="GAE (lambda)")
     madrl_parser.add_argument("--eps", type=float, default=0.2, help="PPO 裁剪因子 (epsilon)")
     madrl_parser.add_argument("--gamma", type=float, default=0.99, help="折扣因子 (gamma)")
     madrl_parser.add_argument("--epochs", type=int, default=10, help="每次更新迭代次数")
     madrl_parser.add_argument("--total_time_slots", type=int, default=30, help="总时隙数量")
     madrl_parser.add_argument("--hidden_dim", type=int, default=128, help="隐藏层维度")
+    madrl_parser.add_argument("--episodes", type=int, default=2000, help="迭代轮次")
+    return madrl_parser.parse_args()
 
 
 def get_base_args():
@@ -191,7 +78,7 @@ def get_base_args():
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
     base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
-    base_parser.add_argument("--center", type=float, default=[0, 0], help="区域中心坐标 (m)")
+    base_parser.add_argument("--center", type=float, default=[0, 0], help="区域中心坐标 (m)") 
 
     # 信道参数
     base_parser.add_argument("--ref_path_loss_db", type=float, default=-30, help="1m 参考路径损耗 (dB)")
@@ -249,8 +136,10 @@ def get_base_args():
 
 if __name__ == "__main__":
     setSeed(seed = 42)  # 设置全局唯一种子 保证仿真可复现
-
-    writer = get_tensorboard_writer(log_dir = f"runs/beta-ippo/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_beta-ippo_result")  # 利用 tensorboard 可视化训练结果
+    
+    # 2026-03-16: Fixed f-string format for python compatibility if needed
+    current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    writer = get_tensorboard_writer(log_dir = f"runs/beta-ippo/{current_time_str}_beta-ippo_result")  # 利用 tensorboard 可视化训练结果
     
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device(
         "cpu")  # 获取 device
@@ -259,86 +148,61 @@ if __name__ == "__main__":
     madrl_args = get_madrl_args()  # 获取 MADRL 参数
 
     # 创建环境
-    env = MyEnv(base_args = base_args, madrl_args = madrl_args)  # 创建环境
-    uavs_pos, cus_pos, targets_pos \
-        = env.generate_pos(uavs_num = base_args.uavs_num,  # UAVs 数量和 targets 数量设置相同
-                       cus_num = base_args.cus_num,  # CUs 的数量多于 UAVs
-                       targets_num = base_args.targets_num,
-                       center = base_args.center,
-                       radius = base_args.radius,
-                       uav_height = base_args.uav_height
-                       )  # 根据圆心和半径生成 UAVs 和 CUs 位置
-    
-    # TODO - channel 随着 UAV 和 CU 位置变化会变化 无法在这里生成 应该在 env.step() 中生成
-    # uavs_2_cus_channel: UAVs -> CUs 信道 (I * J * N)
-    # uavs_2_bs_channel: UAVs -> BS 信道 (I * 1 * N)
-    # cus_2_bs_channel: CUs -> BS 信道 (J * 1)
-    uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels \
-        = env.compute_com_channel_gain(uavs_pos = uavs_pos,
-                                   cus_pos = cus_pos,
-                                   ref_path_loss = db_2_watt(base_args.ref_path_loss_db),  # 1m 下参考路径损耗
-                                   frac_d_lambda = base_args.frac_d_lambda,  # 天线间距为半波长
-                                   alphaction_uav_link = base_args.alphaction_uav_link,  # 与 UAV 有关链路的路径损耗系数
-                                   alpha_cu_link = base_args.alpha_cu_link,  # 与 CU 有关的路径损耗系数
-                                   rician_factor = db_2_watt(base_args.rician_factor_db),  # Rician 因子
-                                   antenna_nums = base_args.antenna_nums  # UAV 天线数量
-                                   )  # 计算通信信道增益
-    
-    # uavs_2_targets_channels: UAVs -> targets 信道响应矩阵 (I * I * N * N)
-    # I 个 UAV 对 I 个 TARGET 的信道 I * I * (a * a^{H}) = I * I * N * N
-    uavs_2_targets_channels \
-        = env.compute_sen_channel_gain(radar_rcs = base_args.radar_rcs,  # 目标 RCS
-                                   frac_d_lambda = base_args.frac_d_lambda,  # 天线间距为半波长
-                                   uavs_pos = uavs_pos,
-                                   targets_pos = targets_pos,
-                                   antenna_nums = base_args.antenna_nums,  # UAV 天线数量
-                                   ref_path_loss = db_2_watt(base_args.ref_path_loss_db)  # 1m 下参考路径损耗
-                                   )  # 计算感知信道响应矩阵
+    env = MyEnv(base_args = base_args, madrl_args = madrl_args) 
 
     # 获取 UAV 和 BS 的状态维度
     state_dim_uav = env.observation_space["uav"]["uav_0"].shape[0]
     state_dim_bs = env.observation_space["bs"].shape[0]
 
-    # 获取 UAV 和 BS 的动作维度以及最高最低值
-    uav_action_space = env.action_space["uav"]["uav_0"]
-    bs_action_space = env.action_space["bs"]
-    uav_action_low = uav_action_space.low
-    action_dim_uav_continuous = uav_action_space["uav_action_continuous"].shape[0]
-    action_dim_uav_discrete = uav_action_space["uav_action_discrete"].n  # 获取离散空间维度，即 CU 的总个数
-    action_uav_low = uav_action_space["uav_action_continuous"].low
-    action_uav_high = uav_action_space["uav_action_continuous"].high
-    bs_action_low = bs_action_space.low
-    bs_action_high = bs_action_space.high
-
+    # 获取 UAV 和 BS 的动作维度
+    action_space_uav = env.action_space["uav"]["uav_0"]
+    action_space_bs = env.action_space["bs"]
+    
+    # 2026-03-16: Reverted to single continuous action space logic
+    action_dim_bs = action_space_bs.shape[0]
+    action_dim_uav = action_space_uav["uav_action_continuous"].shape[0]
+    
+    # 获取 UAV 和 BS 的最高最低值
+    action_uav_low = action_space_uav["uav_action_continuous"].low
+    action_uav_high = action_space_uav["uav_action_continuous"].high
+    bs_action_low = action_space_bs.low
+    bs_action_high = action_space_bs.high
 
     # UAV 和 RIS Agent
     agents_uav = {}
     running_norms_uav = {}
     for i in range(base_args.uavs_num):
         agent_id = f"uav_{i}"
-        agents_uav[agent_id] = IPPO_Hybrid(state_dim_uav, madrl_args.hidden_dim, action_dim_uav_continuous, action_dim_uav_discrete,
-                                actor_lr, critic_lr, lmbda, eps, gamma, epochs, num_episodes, device)
+        agents_uav[agent_id] = IPPO(state_dim_uav, madrl_args.hidden_dim, action_dim_uav,
+                                    action_uav_low, action_uav_high,
+                                    madrl_args.actor_lr, madrl_args.critic_lr, madrl_args.lmbda, 
+                                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.num_episodes, device,
+                                    policy_dist = "Beta", entropy_coef = 0.01)
         running_norms_uav[agent_id] = Normalization(state_dim_uav)  # 为每个 agent 各建一个动态归一化状态空间
 
-    agent_bs = IPPO(state_dim_bs, madrl_args.hidden_dim, action_dim_bs, bs_action_low, bs_action_high,
-                     actor_lr, critic_lr, lmbda, eps, gamma, epochs, num_episodes, device)
+    agent_bs = IPPO(state_dim_bs, madrl_args.hidden_dim, action_dim_bs, 
+                    bs_action_low, bs_action_high,
+                    madrl_args.actor_lr, madrl_args.critic_lr, madrl_args.lmbda, 
+                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.num_episodes, device,
+                    policy_dist = "Beta", entropy_coef = 0.01)
+    
     running_norm_bs = Normalization(state_dim_bs)  # 为每个 agent 各建一个动态归一化状态空间
 
-    reward_scalers_uav = [RewardScaling(shape=1, gamma=gamma) for _ in range(base_args.uavs_num)]
-    reward_scaler_bs = RewardScaling(shape=1, gamma=gamma)
+    reward_scalers_uav = [RewardScaling(shape=1, gamma=madrl_args.gamma) for _ in range(base_args.uavs_num)]
+    reward_scaler_bs = RewardScaling(shape=1, gamma=madrl_args.gamma)
 
     reward_res = []
     all_agents_rewards = []  # 每个agent的奖励记录：[[uav_0, uav_1, ..., ris], ...]
     max_avg_reward = -np.inf  # 用于记录最大的平均奖励
     best_uav_trajectory = None
-    user_trajectory = None
+    cu_trajectory = None
 
-    with tqdm(total=int(num_episodes), desc='Training Progress') as pbar:
-        for i_episode in range(int(num_episodes)):
+    with tqdm(total=int(madrl_args.episodes), desc='Training Progress') as pbar:
+        for i_episode in range(int(madrl_args.episodes)):
             # 每个episode存储各UAV奖励
             episode_rewards_total = []  # 总奖励（环境返回的 total_reward）
             episode_rewards_uav = np.zeros(base_args.uavs_num)  # 每个UAV奖励累计
-            episode_reward_ris = 0.0  # RIS 奖励累计
+            episode_reward_bs = 0.0  # BS 奖励累计
 
             #  为每个 UAV agent 创建独立的 transition_dict
             transition_dicts_uav = {
@@ -350,7 +214,7 @@ if __name__ == "__main__":
                              'dones': [],
                              'real_dones': []}
                 for uav_i in range(base_args.uavs_num)}
-            # --- ADDED END ---
+            #  为 BS agent 创建独立的 transition_dict
             transition_dict_bs = {
                 'states': [],
                 'actions': [],
@@ -363,7 +227,8 @@ if __name__ == "__main__":
             s = env.reset()
             terminal = False
             uav_positions_episode = []  # 初始化当前 episode 的 UAV 轨迹存储
-            user_positions_episode = []
+            cu_positions_episode = []  # 初始化当前 episode 的 CU 轨迹存储
+            target_positions_episode = []  # 初始化当前 episode 的 Target 轨迹存储
 
             # reset reward scaling
             for rs in reward_scalers_uav:
@@ -372,13 +237,19 @@ if __name__ == "__main__":
 
             while not terminal:
                 # --- 为每个 UAV agent 独立处理状态、动作 ---
-                actions_uav_dict = {}
+                actions_uav_dict = {} # For Buffer (Concatenated)
+                # actions_uav_env_dict = {} # Removed: Now passing actions directly
                 old_log_probs_uav_dict = {}
                 state_uav_norm_dict = {}  # 临时存储归一化后的状态
+                
+                
                 uav_positions_episode.append(env.getPosUAV())  # --- 存储当前时隙 UAV 坐标 ---
-                user_positions_episode.append(env.getPosUser())  # --- 存储当前时隙用户坐标 ---
+                
+                cu_positions_episode.append(env.getPosCU())  # --- 存储当前时隙用户坐标 ---
+                
+                target_positions_episode.append(env.getPosTarget())  # --- 存储当前时隙 Target 坐标 ---
 
-                # --- UAV agents 选择动作 ---
+                # UAV agents 选择动作
                 for uav_i in range(base_args.uavs_num):
                     agent_id = f"uav_{uav_i}"
                     # 更新并归一化该 UAV 的状态
@@ -387,25 +258,28 @@ if __name__ == "__main__":
 
                     # 该 UAV agent 采取动作
                     action_uav, old_log_probs_uav = agents_uav[agent_id].choose_action(state_uav_norm)
+                    
                     # 存储 UAV
                     actions_uav_dict[agent_id] = action_uav
                     old_log_probs_uav_dict[agent_id] = old_log_probs_uav
-
-                # --- BS agent 选择动作 ---
+                    
+                # BS agent 选择动作
                 state_bs_norm = running_norm_bs(np.array(s["bs"]))
                 action_bs, old_log_probs_bs = agent_bs.choose_action(state_bs_norm)
-                # --- 环境执行 ---
+                
+                # 环境执行
+                
                 next_s, total_reward, r_dict, done = env.step({"uav": actions_uav_dict, "bs": action_bs}, i_episode)
                 # =====================================================
-                #  r 是 dict： r["uav"], r["ris"]
+                #  r 是 dict： r["uav"], r["bs"]
                 # =====================================================
                 # 解析奖励
-                r_uav_list = [np.mean(r_val) if len(r_val) > 0 else 0.0 for r_val in r_dict["uav"]]
-                r_ris = np.mean(r_dict["ris"]) if len(r_dict["ris"]) > 0 else 0.0
+                r_uav_list = [np.mean(r_val) if np.ndim(r_val) > 0 and len(r_val) > 0 else float(r_val) for r_val in r_dict["uav"]]
+                r_bs = np.mean(r_dict["bs"]) if np.ndim(r_dict["bs"]) > 0 and len(r_dict["bs"]) > 0 else float(r_dict["bs"])
 
                 # 奖励归一化
                 r_uav_norm = [reward_scalers_uav[j](r_uav_list[j]) for j in range(base_args.uavs_num)]
-                r_bs_norm = reward_scaler_bs(r_ris)
+                r_bs_norm = reward_scaler_bs(r_bs)
 
                 # 累计各agent奖励
                 episode_rewards_total.append(total_reward)
@@ -420,7 +294,7 @@ if __name__ == "__main__":
 
                     # 存储已归一化的数据到对应的字典
                     transition_dicts_uav[agent_id]['states'].append(state_uav_norm_dict[agent_id])
-                    transition_dicts_uav[agent_id]['actions'].append(actions_uav_dict[agent_id])
+                    transition_dicts_uav[agent_id]['actions'].append(actions_uav_dict[agent_id]) # Store Concatenated
                     transition_dicts_uav[agent_id]['next_states'].append(next_state_uav_norm)
                     transition_dicts_uav[agent_id]['rewards'].append(r_uav_norm[uav_i])  # 共享奖励
                     transition_dicts_uav[agent_id]['old_log_probs'].append(old_log_probs_uav_dict[agent_id])
@@ -443,8 +317,12 @@ if __name__ == "__main__":
 
             if np.mean(episode_rewards_total) > max_avg_reward:
                 max_avg_reward = np.mean(episode_rewards_total)
-                best_uav_trajectory = np.array(uav_positions_episode)  # shape: (50, uav_num, 3)
-                user_trajectory = np.array(user_positions_episode)
+                if len(uav_positions_episode) > 0:
+                    best_uav_trajectory = np.array(uav_positions_episode)  # shape: (50, uav_num, 3)
+                if len(cu_positions_episode) > 0:
+                    cu_trajectory = np.array(cu_positions_episode)
+                if len(target_positions_episode) > 0:
+                    target_trajectory = np.array(target_positions_episode) # 2026-03-16: Store target trajectory
 
             # ---  更新所有 UAV Agents ---
             for uav_i in range(base_args.uavs_num):
@@ -460,7 +338,7 @@ if __name__ == "__main__":
             avg_bs_reward = episode_reward_bs / len(episode_rewards_total)
 
             reward_res.append(np.mean(episode_rewards_total))  # 统计平均奖励
-            all_agents_rewards.append(np.concatenate([avg_uav_rewards, [avg_ris_reward]]))
+            all_agents_rewards.append(np.concatenate([avg_uav_rewards, [avg_bs_reward]]))
 
             # Average Reward 写入 TensorBoard
             writer.add_scalar("Reward/episode", avg_total_reward, i_episode)
@@ -482,27 +360,27 @@ if __name__ == "__main__":
     plt.plot(episodes_list, reward_array)
     plt.xlabel('Episodes')
     plt.ylabel('Reward')
-    plt.title('IPPO training performance')
+    plt.title('Beta-IPPO training performance')
     plt.show()
 
     # =========== 保存 reward csv 文件 ===========
     # 构造文件名
-    filename = f'{today_str}_IPPO_training_rewards_{noma_group_num}_seed_{seed}.csv'
+    filename = f'{current_time_str}_IPPO_training_rewards_seed_{base_args.seed}.csv'
     # 保存 reward_array 和 episodes_list 到 CSV
     df = pd.DataFrame({
         'episode': episodes_list,
         'reward': reward_array
     })
     df.to_csv(filename, index=False)
-    print(f"训练奖励已保存到 {filename} 中.csv")
+    print(f"训练奖励已保存到 {filename}")
     # =========== 保存 reward csv 文件 ===========
 
     # ========= 保存每个Agent奖励 ========= #
     all_agents_rewards = np.array(all_agents_rewards)
-    columns = [f"UAV_{i}_reward" for i in range(base_args.uavs_num)] + ["RIS_reward"]
+    columns = [f"UAV_{i}_reward" for i in range(base_args.uavs_num)] + ["BS_reward"]
     df_agents = pd.DataFrame(all_agents_rewards, columns=columns)
-    df_agents.insert(0, "episode", np.arange(num_episodes))
-    filename_agents = f'{today_str}_IPPO_all_agents_rewards_seed_{seed}.csv'
+    df_agents.insert(0, "episode", np.arange(madrl_args.episodes))
+    filename_agents = f'{current_time_str}_IPPO_all_agents_rewards_seed_{base_args.seed}.csv'
     df_agents.to_csv(filename_agents, index=False)
     print(f"✅ 所有 Agent 的奖励已保存到 {filename_agents}")
 
@@ -515,28 +393,27 @@ if __name__ == "__main__":
                 x, y, z = best_uav_trajectory[t, uav_i]
                 uav_traj_list.append([t, uav_i, x, y, z])
         df_uav = pd.DataFrame(uav_traj_list, columns=['time_slot', 'uav_id', 'x', 'y', 'z'])
-        df_uav.to_csv(f'{today_str}_SEED{seed}_best_uav_trajectory.csv', index=False)
-        print(f"✅ 最佳 UAV 轨迹已保存：{today_str}_SEED{seed}_best_uav_trajectory.csv")
+        df_uav.to_csv(f'{current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv', index=False)
+        print(f"✅ 最佳 UAV 轨迹已保存：{current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv")
 
-        # ===== 保存 User 轨迹 =====
-        user_traj_list = []
-        for t in range(user_trajectory.shape[0]):
-            for user_i in range(base_args.users_num):
-                x, y, z = user_trajectory[t, user_i]
-                user_traj_list.append([t, user_i, x, y, z])
-        df_user = pd.DataFrame(user_traj_list, columns=['time_slot', 'user_id', 'x', 'y', 'z'])
-        df_user.to_csv(f'{today_str}_SEED{seed}_user_trajectory.csv', index=False)
-        print(f"✅ 用户轨迹已保存：{today_str}_SEED{seed}_user_trajectory.csv")
+    # ===== 保存 CU 轨迹 =====
+    if cu_trajectory is not None:
+        cu_traj_list = []
+        for t in range(cu_trajectory.shape[0]):
+            for cu_i in range(base_args.cus_num):
+                x, y, z = cu_trajectory[t, cu_i]
+                cu_traj_list.append([t, cu_i, x, y, z])
+        df_cu = pd.DataFrame(cu_traj_list, columns=['time_slot', 'cu_id', 'x', 'y', 'z'])
+        df_cu.to_csv(f'{current_time_str}_SEED{base_args.seed}_cu_trajectory.csv', index=False)
+        print(f"✅ CU 轨迹已保存：{current_time_str}_SEED{base_args.seed}_cu_trajectory.csv")
 
-    # =================== 绘制最佳 UAV 轨迹 ===================
-    plt.figure(figsize=(8, 6))
-    for uav_i in range(base_args.uavs_num):
-        traj = best_uav_trajectory[:, uav_i, :]  # shape: (time_slots, 3)
-        plt.plot(traj[:, 0], traj[:, 1], marker='o', label=f'UAV {uav_i}')
-
-    plt.xlabel('X position (m)')
-    plt.ylabel('Y position (m)')
-    plt.title('Best UAV trajectories over 50 time slots')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # ===== 保存 TARGET 位置 =====
+    if target_trajectory is not None:
+        target_traj_list = []
+        for t in range(target_trajectory.shape[0]):
+            for target_i in range(base_args.targets_num):
+                x, y, z = target_trajectory[t, target_i]
+                target_traj_list.append([t, target_i, x, y, z])
+        df_target = pd.DataFrame(target_traj_list, columns=['time_slot', 'target_id', 'x', 'y', 'z'])
+        df_target.to_csv(f'{current_time_str}_SEED{base_args.seed}_target_trajectory.csv', index=False)
+        print(f"✅ TARGET 轨迹已保存：{current_time_str}_SEED{base_args.seed}_target_trajectory.csv")
