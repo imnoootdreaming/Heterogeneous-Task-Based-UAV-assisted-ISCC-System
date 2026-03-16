@@ -2,6 +2,7 @@ import gym
 from gym import spaces
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from inner_problem.penalty_based_cccp_algorithm import energy_opt
 from my_reward import MyReward
 from math import pi, sqrt
 
@@ -68,6 +69,11 @@ class MyEnv(gym.Env):
                                     antenna_nums = base_args.antenna_nums,  # UAV 天线数量
                                     ref_path_loss = db_2_watt(base_args.ref_path_loss_db)  # 1m 下参考路径损耗
                                     )  # 计算感知信道响应矩阵
+        
+        self.uavs_targets_matched_matrix \
+        = match_uav_targets_nearest(uavs_pos = uavs_pos,
+                                    targets_pos = targets_pos
+                                    )
         # -------- 初始化信道矩阵 --------
         
         # -------- 定义动作空间 --------
@@ -115,7 +121,8 @@ class MyEnv(gym.Env):
         # UAV 观测空间
         # 1. UAV i 的坐标
         # 2. UAV <==> BS 的信道
-        obs_dim_uav = 3 + 1
+        # 3. UAV <==> 感知的 TARGET 的信道
+        obs_dim_uav = 3 + self.base_args.antenna_nums + self.base_args.antenna_nums * self.base_args.antenna_nums
         self.observation_space["uav"] = {
             f"uav_{i}": spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -140,7 +147,7 @@ class MyEnv(gym.Env):
         # -------- 定义状态空间 --------
 
         # -------- 初始化奖励函数 --------
-        self.reward_calculator = MyReward() # 初始化奖励类
+        self.reward_calculator = MyReward(self.base_args) # 初始化奖励类
         # -------- 初始化奖励函数 --------
 
         self.t = 0  # 初始时隙 index 为 0 
@@ -169,24 +176,39 @@ class MyEnv(gym.Env):
             diff_thetas.append(act[0])
             diff_distances.append(act[1])
             sen_durations.append(act[2])
-        
+        diff_theta = np.array(diff_thetas)
+        diff_distance = np.array(diff_distances)
+        sen_duration = np.array(sen_durations)
+
+        # BS 动作提取
         bs_actions = actions["bs"]
         bs_actions_low = self.action_space["bs"].low
         bs_actions_high = self.action_space["bs"].high
         bs_actions = bs_actions * (bs_actions_high - bs_actions_low) + bs_actions_low
-        # BS 动作提取
-        cu_powers = bs_actions[:self.base_args.cus_num]
+        cus_off_power = bs_actions[:self.base_args.cus_num]
         uav_spectrum_sharing_coeffs = bs_actions[self.base_args.cus_num:]
-        
+        # 将每个UAV选择的CU索引转换为 one-hot 矩阵
+        uavs_cus_matched_matrix = np.zeros((self.base_args.uavs_num, self.base_args.cus_num))
+        for i in range(self.base_args.uavs_num):
+            # 取整得到CU索引
+            cu_idx = int(np.clip(round(uav_spectrum_sharing_coeffs[i]), 0, self.base_args.cus_num - 1))
+            uavs_cus_matched_matrix[i, cu_idx] = 1
+
         # next_uavs_pos 根据动作生成
-        diff_theta = np.array(diff_thetas)
-        diff_distance = np.array(diff_distances)
         next_uavs_pos = self.cur_uav_pos + np.stack([diff_distance * np.cos(diff_theta),
                                                     diff_distance * np.sin(diff_theta),
                                                     np.zeros_like(diff_distance * np.cos(diff_theta))], axis=1)
 
-        # TODO - 奖励计算
-        total_reward, reward, total_delay = self.reward_calculator.reward_compute()
+        total_reward, reward, energy_opt = self.reward_calculator.reward_compute(uav_2_cus_channels = self.uavs_2_cus_channels,
+                                                                                  uavs_2_bs_channels = self.uavs_2_bs_channels,
+                                                                                  cus_2_bs_channels = self.cus_2_bs_channels,
+                                                                                  uavs_2_targets_channels = self.uavs_2_targets_channels,
+                                                                                  uavs_targets_matched_matrix = self.uavs_targets_matched_matrix,
+                                                                                  uavs_cus_matched_matrix = uavs_cus_matched_matrix,
+                                                                                  uavs_pos_pre = self.cur_uav_pos,
+                                                                                  next_uavs_pos = next_uavs_pos,
+                                                                                  uavs_off_duration = sen_duration,
+                                                                                  cus_off_power = cus_off_power)
 
         # 下一状态更新
         self.t += 1  # 时隙 index 增加 1
@@ -203,7 +225,7 @@ class MyEnv(gym.Env):
                                 rician_factor = db_2_watt(self.base_args.rician_factor_db),  # Rician 因子
                                 antenna_nums = self.base_args.antenna_nums  # UAV 天线数量
                                 )  # 计算通信信道增益
-    
+
         # uavs_2_targets_channels: UAVs -> targets 信道响应矩阵 (I * I * N * N)
         # I 个 UAV 对 I 个 TARGET 的信道 I * I * (a * a^{H}) = I * I * N * N
         self.uavs_2_targets_channels \
@@ -215,6 +237,11 @@ class MyEnv(gym.Env):
                                     ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db)  # 1m 下参考路径损耗 
                                     )  # 计算感知信道响应矩阵
 
+        self.uavs_targets_matched_matrix \
+        = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+                                    targets_pos = self.init_targets_pos
+                                    )
+
         next_state_dict = {"uav": {}, "bs": None}
 
         # 生成下一个状态空间
@@ -222,9 +249,13 @@ class MyEnv(gym.Env):
             uav_coord = self.cur_uavs_pos[i]
             uavs_2_cus_channels_i = self.uavs_2_cus_channels[i]
             uavs_2_bs_channels_i = self.uavs_2_bs_channels[i]
+            # 根据索引选择 UAV 此时感知的 TARGET
+            target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
+            uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
             uav_obs = np.concatenate([uav_coord, 
                                       uavs_2_cus_channels_i.flatten(), 
-                                      uavs_2_bs_channels_i.flatten()
+                                      uavs_2_bs_channels_i.flatten(),
+                                      uavs_2_targets_channels_i.flatten()
                                       ]).astype(np.float32)
             next_state_dict["uav"][f"uav_{i}"] = uav_obs
         # BS 观测空间
@@ -262,7 +293,19 @@ class MyEnv(gym.Env):
                                    rician_factor = db_2_watt(self.base_args.rician_factor_db),  # Rician 因子
                                    antenna_nums = self.base_args.antenna_nums  # UAV 天线数量
                                    )  # 计算通信信道增益
-    
+        self.uavs_2_targets_channels \
+            = self.compute_sen_channel_gain(radar_rcs = self.base_args.radar_rcs,  # 目标 RCS
+                                    frac_d_lambda = self.base_args.frac_d_lambda,  # 天线间距为半波长
+                                    uavs_pos = self.cur_uavs_pos,
+                                    targets_pos = self.init_targets_pos,
+                                    antenna_nums = self.base_args.antenna_nums,  # UAV 天线数量
+                                    ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db)  # 1m 下参考路径损耗 
+                                    )  # 计算感知信道响应矩阵
+
+        self.uavs_targets_matched_matrix \
+        = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+                                    targets_pos = self.init_targets_pos
+                                    )
         # 初始化观测空间 init_state_dict
         # UAV 观测空间
         # 1. UAV i 的坐标
@@ -273,9 +316,13 @@ class MyEnv(gym.Env):
             uav_coord = self.init_uavs_pos[i]
             uavs_2_cus_channels_i = self.uavs_2_cus_channels[i]
             uavs_2_bs_channels_i = self.uavs_2_bs_channels[i]
+            # 根据匹配矩阵选择对应的目标通道
+            target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
+            uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
             uav_obs = np.concatenate([uav_coord, 
                                       uavs_2_cus_channels_i.flatten(), 
-                                      uavs_2_bs_channels_i.flatten()
+                                      uavs_2_bs_channels_i.flatten(),
+                                      uavs_2_targets_channels_i.flatten()
                                       ]).astype(np.float32)
             init_state_dict["uav"][f"uav_{i}"] = uav_obs
         # BS 观测空间
