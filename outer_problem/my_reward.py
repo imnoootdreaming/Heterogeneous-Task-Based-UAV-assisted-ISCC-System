@@ -14,7 +14,7 @@ class MyReward:
                        uavs_pos, uavs_pos_cur, uavs_off_duration, cus_off_power):
         uav_collision_penalty = np.zeros(self.base_args.uavs_num)  # 每个 UAV 的碰撞惩罚
         uav_exceed_boundary_penalty = np.zeros(self.base_args.uavs_num)  # 每个 UAV 的越界惩罚
-        reward = {"uav": [[] for _ in range(self.base_args.uavs_num)], "bs": []}
+        reward = {"uav": [0.0] * self.base_args.uavs_num, "bs": 0.0}
 
         # UAV 边界检查
         for i in range(self.base_args.uavs_num):
@@ -22,8 +22,8 @@ class MyReward:
             if x < -self.x_max or x > self.x_max or y < -self.y_max or y > self.y_max:
                 uav_exceed_boundary_penalty[i] = 1
                 # 拉回边界
-                uavs_pos[i][0] = np.clip(x, 0, self.x_max)
-                uavs_pos[i][1] = np.clip(y, 0, self.y_max)    
+                uavs_pos[i][0] = np.clip(x, -self.x_max, self.x_max)
+                uavs_pos[i][1] = np.clip(y, -self.y_max, self.y_max)    
             # UAV 碰撞检测
             for j in range(i + 1, self.base_args.uavs_num):
                 dist = np.linalg.norm(uavs_pos[i] - uavs_pos[j])
@@ -31,7 +31,6 @@ class MyReward:
                     uav_collision_penalty[i] = 1
                     uav_collision_penalty[j] = 1
         
-        # TODO - BS 选择系数冲突
         # 对每一列求和，计算每个CU被多少个UAV选择，对于每个CU，如果被选择的UAV数量大于1，多出的部分就是惩罚
         bs_alloc_spectrum_penalty = np.sum(np.maximum(0, np.sum(uavs_cus_matched_matrix, axis=0) - 1))
 
@@ -46,10 +45,11 @@ class MyReward:
                                                                         uavs_pos_cur = uavs_pos_cur,
                                                                         uavs_off_duration = uavs_off_duration,
                                                                         cus_off_power = cus_off_power)
-
-        # TODO - 返回奖励
+                                                                        
+        reward_4_energy = np.exp(-energy_opt)
         for i in range(self.base_args.uavs_num):
-            vio = - (uav_collision_penalty + uav_exceed_boundary_penalty)
-            reward["uav"][i].append()
-        reward["bs"] = - bs_alloc_spectrum_penalty
+            reward["uav"][i] = reward_4_energy - uav_collision_penalty[i] - uav_exceed_boundary_penalty[i]
+        reward["bs"] = reward_4_energy - bs_alloc_spectrum_penalty
+        # 计算总奖励
+        total_reward = reward_4_energy - bs_alloc_spectrum_penalty - np.sum(uav_exceed_boundary_penalty) - np.sum(uav_collision_penalty)
         return total_reward, reward, energy_opt
