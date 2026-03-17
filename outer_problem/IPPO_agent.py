@@ -272,41 +272,36 @@ class IPPO:
         actor_losses = []
         critic_losses = []
 
-        # ++++++++++ 对同一批数据进行多轮优化 ++++++++++
-        for epoch in range(self.epochs):
-            if self.policy_dist == "Beta":
-                # ---------------- 连续动作 log_prob (使用当前策略) ----------------
-                dist_now = self.actor.get_dist(states)
-                dist_entropy = dist_now.entropy().sum(dim=1, keepdim=True)  # 多维动作空间求和
-                log_probs = dist_now.log_prob(actions).sum(dim=1, keepdim=True)
-            else:
-                # Gaussian 分布直接调用 evaluate，传入 state 和 buffer 里的 action
-                log_probs, dist_entropy = self.actor.evaluate(states, actions)
+        batch_size = states.size(0)  # 新增: 当前回合采样总数，兼容 beta-IPPO_main.py 的 transition_dict 长度
+        mini_batch_size = min(64, batch_size)  # 新增: 最小改动引入小批量，样本不足 64 时自动退化为全量
 
-            # ---------------- PPO 损失 ----------------
-            # 在第二轮及以后, log_probs 和 old_log_probs 将不同
-            ratio = torch.exp(log_probs - old_log_probs)
-            surr1 = ratio * adv
-            surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * adv
+        # ++++++++++ 对同一批数据进行多轮优化（每轮内随机小批量） ++++++++++
+        for epoch in range(self.epochs):  # 修改: 保留原 epochs 逻辑不变
+            for index in BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, False):  # 修改: 引入随机无放回小批量采样
+                if self.policy_dist == "Beta":  # 修改: 在 mini-batch 上计算当前策略分布
+                    dist_now = self.actor.get_dist(states[index])  # 修改: 仅取当前 mini-batch 的状态
+                    dist_entropy = dist_now.entropy().sum(dim=1, keepdim=True)  # 修改: mini-batch 多维动作熵求和
+                    log_probs = dist_now.log_prob(actions[index]).sum(dim=1, keepdim=True)  # 修改: mini-batch 动作对数概率
+                else:
+                    log_probs, dist_entropy = self.actor.evaluate(states[index], actions[index])  # 修改: Gaussian 分支改为 mini-batch 计算
 
-            # # ++++++++++ 加上策略熵 ++++++++++
-            # actor_loss = torch.mean(-torch.min(surr1, surr2) - self.entropy_coef * dist_entropy)
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
+                ratio = torch.exp(log_probs - old_log_probs[index])  # 修改: PPO 比率改为 mini-batch 对齐
+                surr1 = ratio * adv[index]  # 修改: surrogate-1 改为 mini-batch 对齐
+                surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * adv[index]  # 修改: surrogate-2 改为 mini-batch 对齐
+                actor_loss = torch.mean(-torch.min(surr1, surr2))  # 修改: actor 损失在 mini-batch 上求均值
 
-            critic_loss = torch.mean(F.mse_loss(self.critic(states), v_target.detach()))
+                critic_loss = F.mse_loss(self.critic(states[index]), v_target[index].detach())  # 修改: critic 损失改为 mini-batch 对齐
 
-            # ---------------- 梯度更新 ----------------
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            actor_loss.backward()
-            # ++++++++++ 梯度裁剪 ++++++++++
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
-            actor_losses.append(actor_loss.item())
-            critic_losses.append(critic_loss.item())
+                self.actor_optimizer.zero_grad()  # 修改: mini-batch 级别梯度清零
+                self.critic_optimizer.zero_grad()  # 修改: mini-batch 级别梯度清零
+                actor_loss.backward()  # 修改: mini-batch 反向传播 actor
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)  # 修改: mini-batch 梯度裁剪 actor
+                critic_loss.backward()  # 修改: mini-batch 反向传播 critic
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)  # 修改: mini-batch 梯度裁剪 critic
+                self.actor_optimizer.step()  # 修改: mini-batch 参数更新 actor
+                self.critic_optimizer.step()  # 修改: mini-batch 参数更新 critic
+                actor_losses.append(actor_loss.item())  # 修改: 记录 mini-batch actor 损失
+                critic_losses.append(critic_loss.item())  # 修改: 记录 mini-batch critic 损失
 
         self.lr_decay(step)
 
@@ -314,7 +309,11 @@ class IPPO:
         if writer is not None and step is not None:
             writer.add_scalar(f"{agent_name}/Actor_Loss", np.mean(actor_losses), step)
             writer.add_scalar(f"{agent_name}/Critic_Loss", np.mean(critic_losses), step)
-            kl = (old_log_probs - log_probs).mean().item()
+            if self.policy_dist == "Beta":  # 新增: 为 KL 记录重新计算全量 log_probs（避免仅用最后一个 mini-batch）
+                kl_log_probs = self.actor.get_dist(states).log_prob(actions).sum(dim=1, keepdim=True)  # 新增: Beta 全量 log_probs
+            else:
+                kl_log_probs, _ = self.actor.evaluate(states, actions)  # 新增: Gaussian 全量 log_probs
+            kl = (old_log_probs - kl_log_probs).mean().item()  # 修改: KL 统计基于全量样本
             writer.add_scalar(f"{agent_name}/KL_Divergence", kl, step)
 
 
