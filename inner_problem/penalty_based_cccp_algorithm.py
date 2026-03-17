@@ -66,10 +66,10 @@ def get_base_args():
 
     # 基于惩罚的 CCCP 算法参数
     base_parser.add_argument("--max_iterations", type=int, default=30, help="CCCP 算法最大迭代次数")
-    base_parser.add_argument("--cccp_threshold", type=float, default=1e-4, help="CCCP 算法收敛阈值")
+    base_parser.add_argument("--cccp_threshold", type=float, default=1e-3, help="CCCP 算法收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1e-2, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
-    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45, auxiliary_t", help="启用约束组，逗号分隔")
+    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
     return base_parser.parse_args()
@@ -691,7 +691,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
 
         # Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
         # 加上 reg 对角正则化
-        reg = sigma_2 * np.eye(N)
+        reg = 1e-6 * np.eye(N)
         Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T) + reg
 
         # log2 det(Δ_i)
@@ -910,6 +910,18 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         constraints.append(
             var_auxiliary_variable_z[i] + cp.square(var_bs_2_uav_freqs_norm[i] * args.freq_scale) - var_t[i] <= 0
         )
+    
+    for i in range(I):
+        constraints += [
+            var_auxiliary_variable_z[i] >= 0,
+            var_bs_2_uav_freqs_norm[i] >= 0,
+            var_t[i] >= 0,
+        ]
+
+    for j in range(J):
+        constraints += [
+            var_cus_off_duration[j] >= 0
+        ]
 
     return constraints
 
@@ -959,6 +971,8 @@ def build_constraint_map(args, constraints):
     constraint_map["4.45"] = constraints[idx:idx + J]
     idx += J
     constraint_map["auxiliary_t"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["var"] = constraints[idx:idx + I * 3 + J]
     return constraint_map
 
 
@@ -1042,8 +1056,8 @@ def penalty_based_cccp(args,
     var_cus_off_duration = cp.Variable(args.cus_num, nonneg=True)
     var_t = cp.Variable(args.uavs_num, nonneg=True)  # 辅助变量 t 是为了保障满足 DCP, 该变量没有在文中使用
     # 声明初始值
-    hat_auxiliary_variable_z = np.ones(args.uavs_num) * 3e5
-    hat_bs_2_uav_freqs_norm = np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num)
+    hat_auxiliary_variable_z = np.ones(args.uavs_num) * 3e3
+    hat_bs_2_uav_freqs_norm = np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / 2)
     hat_uav_sen_beams, hat_uav_off_beams = initialize_uav_beams(args = args,
                                                                 matched_uav_sensing_channel = matched_uav_sensing_channel,
                                                                 uavs_2_bs_channels = uavs_2_bs_channels
@@ -1105,9 +1119,12 @@ def penalty_based_cccp(args,
             print(f"启用约束组: {active_groups}")
 
         problem = cp.Problem(cp.Minimize(obj_fun), constraints) 
-        problem.solve(solver=cp.SCS, warm_start=True)
+        problem.solve(solver=cp.SCS, eps=1e-5, max_iters=10000, verbose=True)
 
-        print("status:", problem.status)
+        print(f"第 {iter + 1} 轮迭代状态:", problem.status)
+        print(f"第 {iter + 1} 轮迭代目标函数值:", problem.value)
+        
+
         # 如果优化器此时处理结果是 infeasible : 判断是哪个约束导致
         if problem.status in ("infeasible", "infeasible_inaccurate"):
             print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
@@ -1120,6 +1137,11 @@ def penalty_based_cccp(args,
             iter_count = iter + 1
             break
         elif problem.status in ("optimal", "optimal_inaccurate"):
+            print(f"第 {iter + 1} 轮 UAV 感知波束 = {[v.value for v in var_uavs_sen_beam]}" )
+            print(f"第 {iter + 1} 轮 UAV 卸载波束 = {[v.value for v in var_uavs_off_beam]}" )
+            print(f"第 {iter + 1} 轮 BS 计算频率 = {var_bs_2_uav_freqs_norm.value * args.freq_scale}" )
+            print(f"第 {iter + 1} 轮辅助变量 z = {var_auxiliary_variable_z.value}" )
+            print(f"第 {iter + 1} 轮 CU 卸载持续时长 = {var_cus_off_duration.value}" )
             for k, con in enumerate(constraints):
                 try:
                     val = con.violation()
@@ -1128,21 +1150,22 @@ def penalty_based_cccp(args,
                 except Exception as e:
                     print(f"约束 [{k}] 检查失败: {e}")
 
-
         # 计算当前目标函数值
         cur_obj_fun_val = problem.value
 
         # 检查收敛性
         if abs(cur_obj_fun_val - pre_obj_fun_val) < args.cccp_threshold:
             iter_count = iter + 1
-            print(f"CCCP算法迭代过程收敛在第 {iter_count + 1} 轮")
+            print(f"CCCP 算法迭代过程收敛在第 {iter_count + 1} 轮")
             obj_fun_opt = cur_obj_fun_val
             # 当前优化结果
-            print(f"UAV 感知波束 = {[v.value for v in var_uavs_sen_beam]}" )
-            print(f"UAV 卸载波束 = {[v.value for v in var_uavs_off_beam]}" )
-            print(f"BS 计算频率 = {var_bs_2_uav_freqs_norm.value * args.freq_scale}" )
-            print(f"辅助变量 z = {var_auxiliary_variable_z.value}" )
-            print(f"CU 卸载持续时长 = {var_cus_off_duration.value}" )
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮迭代状态:", problem.status)
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮迭代目标函数值:", problem.value)
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮 UAV 感知波束 = {[v.value for v in var_uavs_sen_beam]}" )
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮 UAV 卸载波束 = {[v.value for v in var_uavs_off_beam]}" )
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮 BS 计算频率 = {var_bs_2_uav_freqs_norm.value * args.freq_scale}" )
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮辅助变量 z = {var_auxiliary_variable_z.value}" )
+            print(f"Convergency!!! - 第 {iter_count + 1} 轮 CU 卸载持续时长 = {var_cus_off_duration.value}" )
             break
 
         # 下一轮迭代赋值
