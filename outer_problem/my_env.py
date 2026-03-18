@@ -2,7 +2,6 @@ import gym
 from gym import spaces
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from inner_problem.penalty_based_cccp_algorithm import energy_opt
 from my_reward import MyReward
 from math import pi, sqrt
 
@@ -34,11 +33,7 @@ class MyEnv(gym.Env):
         self.base_args = base_args
         self.madrl_args = madrl_args
         # -------- 初始化位置 --------
-        self.init_uavs_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.uavs_num, 3), dtype=float)
-        self.init_cus_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 3), dtype=float)
-        self.init_targets_pos = np.zeros((self.madrl_args.total_time_slots, self.base_args.targets_num, 3), dtype=float)
-        self.generate_pos(self.base_args.uavs_num, self.base_args.cus_num, self.base_args.targets_num, 
-                          self.base_args.center, self.base_args.radius, self.base_args.uav_height)
+        self.init_uavs_pos, self.init_cus_pos, self.init_targets_pos = self.generate_pos(self.base_args.uavs_num, self.base_args.cus_num, self.base_args.targets_num, self.base_args.center, self.base_args.radius, self.base_args.uav_height)
         self.cur_uavs_pos = self.init_uavs_pos  # 初始的 UAV 位置
         self.precomputed_cus_traj = self.generate_cu_trajectory()  # 提前生成的 CU 轨迹
         self.cur_cus_pos = self.init_cus_pos  # 初始的 CU 位置
@@ -71,8 +66,8 @@ class MyEnv(gym.Env):
                                     )  # 计算感知信道响应矩阵
         
         self.uavs_targets_matched_matrix \
-        = match_uav_targets_nearest(uavs_pos = uavs_pos,
-                                    targets_pos = targets_pos
+        = self.match_uav_targets_nearest(uavs_pos = self.init_uavs_pos,
+                                    targets_pos = self.init_targets_pos
                                     )
         # -------- 初始化信道矩阵 --------
         
@@ -120,9 +115,9 @@ class MyEnv(gym.Env):
 
         # UAV 观测空间
         # 1. UAV i 的坐标
-        # 2. UAV <==> BS 的信道
-        # 3. UAV <==> 感知的 TARGET 的信道
-        obs_dim_uav = 3 + self.base_args.antenna_nums + self.base_args.antenna_nums * self.base_args.antenna_nums
+        # 2. UAV <==> BS 的信道 (real + imag 实部 + 虚部)
+        # 3. UAV <==> 感知的 TARGET 的信道 (real + imag 实部 + 虚部)
+        obs_dim_uav = 3 + self.base_args.antenna_nums * 2 + self.base_args.antenna_nums * self.base_args.antenna_nums * 2
         self.observation_space["uav"] = {
             f"uav_{i}": spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -133,11 +128,11 @@ class MyEnv(gym.Env):
         }
 
         # BS 观测空间
-        # 1. 每个 CU <==> BS 信道 (shape = cus_num)
-        # 2. 每个 CU <==> 每个 UAV 信道 (shape = cus_num * uavs_num) 
+        # 1. 每个 CU <==> BS 信道 (shape = (real + imag 实部 + 虚部))
+        # 2. 每个 CU <==> 每个 UAV 信道 (shape = (real + imag 实部 + 虚部))
         obs_dim_bs = (
-            self.base_args.cus_num +                              # CU-BS 信道
-            self.base_args.cus_num * self.base_args.uavs_num    # CU-UAV 信道
+            self.base_args.cus_num * 2 +                              # CU-BS 信道
+            self.base_args.cus_num * self.base_args.uavs_num * self.base_args.antenna_nums * 2    # CU-UAV 信道
         )
         self.observation_space["bs"] = spaces.Box(
             low=-np.inf, high=np.inf,
@@ -165,7 +160,7 @@ class MyEnv(gym.Env):
         uav_actions_dict = actions["uav"]
         diff_thetas = []
         diff_distances = []
-        sen_durations = []
+        off_durations = []
 
         # UAV 动作提取
         for i in range(self.base_args.uavs_num):
@@ -175,10 +170,10 @@ class MyEnv(gym.Env):
             act = act * (high - low) + low
             diff_thetas.append(act[0])
             diff_distances.append(act[1])
-            sen_durations.append(act[2])
+            off_durations.append(act[2])
         diff_theta = np.array(diff_thetas)
         diff_distance = np.array(diff_distances)
-        sen_duration = np.array(sen_durations)
+        off_duration = np.array(off_durations)
 
         # BS 动作提取
         bs_actions = actions["bs"]
@@ -199,7 +194,7 @@ class MyEnv(gym.Env):
                                                     diff_distance * np.sin(diff_theta),
                                                     np.zeros_like(diff_distance * np.cos(diff_theta))], axis=1)
 
-        total_reward, reward, energy_opt = self.reward_calculator.reward_compute(uav_2_cus_channels = self.uavs_2_cus_channels,
+        total_reward, reward, energy_opt = self.reward_calculator.reward_compute(uavs_2_cus_channels = self.uavs_2_cus_channels,
                                                                                   uavs_2_bs_channels = self.uavs_2_bs_channels,
                                                                                   cus_2_bs_channels = self.cus_2_bs_channels,
                                                                                   uavs_2_targets_channels = self.uavs_2_targets_channels,
@@ -207,7 +202,7 @@ class MyEnv(gym.Env):
                                                                                   uavs_cus_matched_matrix = uavs_cus_matched_matrix,
                                                                                   uavs_pos_pre = self.cur_uav_pos,
                                                                                   next_uavs_pos = next_uavs_pos,
-                                                                                  uavs_off_duration = sen_duration,
+                                                                                  uavs_off_duration = off_duration,
                                                                                   cus_off_power = cus_off_power)
 
         # 下一状态更新
@@ -238,7 +233,7 @@ class MyEnv(gym.Env):
                                     )  # 计算感知信道响应矩阵
 
         self.uavs_targets_matched_matrix \
-        = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+            = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
 
@@ -252,15 +247,19 @@ class MyEnv(gym.Env):
             # 根据索引选择 UAV 此时感知的 TARGET
             target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
             uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
-            uav_obs = np.concatenate([uav_coord, 
-                                      uavs_2_cus_channels_i.flatten(), 
-                                      uavs_2_bs_channels_i.flatten(),
-                                      uavs_2_targets_channels_i.flatten()
-                                      ]).astype(np.float32)
+            uav_obs = np.concatenate([
+                                    uav_coord.astype(np.float32),
+                                    uavs_2_bs_channels_i.real.flatten(),
+                                    uavs_2_bs_channels_i.imag.flatten(),
+                                    uavs_2_targets_channels_i.real.flatten(),
+                                    uavs_2_targets_channels_i.imag.flatten()
+                                ]).astype(np.float32)
             next_state_dict["uav"][f"uav_{i}"] = uav_obs
         # BS 观测空间
         # 1. CU <==> BS 信道
-        bs_obs = np.concatenate([self.cus_2_bs_channels.flatten()]).astype(np.float32)
+        # 2. CU <==> UAV 信道
+        bs_obs = np.concatenate([self.cus_2_bs_channels.real.flatten(), self.cus_2_bs_channels.imag.flatten(),
+                                self.uavs_2_cus_channels.real.flatten(), self.uavs_2_cus_channels.imag.flatten()]).astype(np.float32)
         next_state_dict["bs"] = bs_obs
 
         # 判断是否需要进行截断
@@ -303,7 +302,7 @@ class MyEnv(gym.Env):
                                     )  # 计算感知信道响应矩阵
 
         self.uavs_targets_matched_matrix \
-        = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+        = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
         # 初始化观测空间 init_state_dict
@@ -319,15 +318,19 @@ class MyEnv(gym.Env):
             # 根据匹配矩阵选择对应的目标通道
             target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
             uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
-            uav_obs = np.concatenate([uav_coord, 
-                                      uavs_2_cus_channels_i.flatten(), 
-                                      uavs_2_bs_channels_i.flatten(),
-                                      uavs_2_targets_channels_i.flatten()
-                                      ]).astype(np.float32)
+            uav_obs = np.concatenate([
+                                    uav_coord.astype(np.float32),
+                                    uavs_2_bs_channels_i.real.flatten(),
+                                    uavs_2_bs_channels_i.imag.flatten(),
+                                    uavs_2_targets_channels_i.real.flatten(),
+                                    uavs_2_targets_channels_i.imag.flatten()
+                                ]).astype(np.float32)
             init_state_dict["uav"][f"uav_{i}"] = uav_obs
         # BS 观测空间
         # 1. CU <==> BS 信道
-        bs_obs = np.concatenate([self.cus_2_bs_channels.flatten()]).astype(np.float32)
+        # 2. CU <==> UAV 信道
+        bs_obs = np.concatenate([self.cus_2_bs_channels.real.flatten(), self.cus_2_bs_channels.imag.flatten(),
+                                self.uavs_2_cus_channels.real.flatten(), self.uavs_2_cus_channels.imag.flatten()]).astype(np.float32)
         init_state_dict["bs"] = bs_obs
 
         return init_state_dict  # reward, done, info can't be included
@@ -345,9 +348,9 @@ class MyEnv(gym.Env):
         """
         获取当前时隙 CU 坐标
         """
-        if self.t < self.cus_pos.shape[0]:
-             return self.cus_pos[self.t]
-        return self.cus_pos[-1]
+        if self.t < self.cur_cus_pos.shape[0]:
+             return self.cur_cus_pos[self.t]
+        return self.cur_cus_pos[-1]
 
 
     def getPosTarget(self):
@@ -397,12 +400,6 @@ class MyEnv(gym.Env):
         targets_pos = np.zeros((targets_num, 3))
         targets_pos[:, 0] = center[0] + r_target * np.cos(theta_target)
         targets_pos[:, 1] = center[1] + r_target * np.sin(theta_target)
-        # targets_pos[:, 2] = 0  # 默认为 0
-        
-        # 存储初始位置
-        self.init_uavs_pos[0] = uavs_pos
-        self.init_cus_pos[0] = cus_pos
-        self.init_targets_pos[0] = targets_pos
             
         return uavs_pos, cus_pos, targets_pos
 
@@ -549,8 +546,8 @@ class MyEnv(gym.Env):
         velocities = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 2), dtype=float)
 
         # 初始化起始位置和速度
-        if self.cus_pos.shape[0] > 0:
-            traj[0] = self.cus_pos[0].copy()
+        if self.init_cus_pos.shape[0] > 0:
+            traj[0] = self.init_cus_pos[0].copy()
         
         # Fix: markov_velocity is list, need to convert or use directly if numpy handled
         # Assuming base_args.markov_velocity is list like [1, 0, 0]

@@ -1,4 +1,13 @@
-from inner_problem import penalty_based_cccp_algorithm
+import os
+import sys
+# 获取当前文件的目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取outer_problem的父目录（即项目根目录）
+parent_dir = os.path.dirname(current_dir)
+# 将父目录添加到sys.path
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+from inner_problem.penalty_based_cccp_algorithm import penalty_based_cccp
 import numpy as np
 
 class MyReward:

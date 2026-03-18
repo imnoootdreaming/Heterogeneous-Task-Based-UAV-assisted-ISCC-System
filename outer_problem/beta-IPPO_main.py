@@ -155,18 +155,14 @@ if __name__ == "__main__":
     state_dim_bs = env.observation_space["bs"].shape[0]
 
     # 获取 UAV 和 BS 的动作维度
-    action_space_uav = env.action_space["uav"]["uav_0"]
-    action_space_bs = env.action_space["bs"]
-    
-    # 2026-03-16: Reverted to single continuous action space logic
-    action_dim_bs = action_space_bs.shape[0]
-    action_dim_uav = action_space_uav["uav_action_continuous"].shape[0]
+    action_dim_bs = env.action_space["bs"].shape[0]
+    action_dim_uav = env.action_space["uav"]["uav_0"].shape[0]
     
     # 获取 UAV 和 BS 的最高最低值
-    action_uav_low = action_space_uav["uav_action_continuous"].low
-    action_uav_high = action_space_uav["uav_action_continuous"].high
-    bs_action_low = action_space_bs.low
-    bs_action_high = action_space_bs.high
+    action_uav_low = env.action_space["uav"]["uav_0"].low
+    action_uav_high = env.action_space["uav"]["uav_0"].high
+    bs_action_low = env.action_space["bs"].low
+    bs_action_high = env.action_space["bs"].high
 
     # UAV 和 RIS Agent
     agents_uav = {}
@@ -176,14 +172,14 @@ if __name__ == "__main__":
         agents_uav[agent_id] = IPPO(state_dim_uav, madrl_args.hidden_dim, action_dim_uav,
                                     action_uav_low, action_uav_high,
                                     madrl_args.actor_lr, madrl_args.critic_lr, madrl_args.lmbda, 
-                                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.num_episodes, device,
+                                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.episodes, device,
                                     policy_dist = "Beta", entropy_coef = 0.01)
         running_norms_uav[agent_id] = Normalization(state_dim_uav)  # 为每个 agent 各建一个动态归一化状态空间
 
     agent_bs = IPPO(state_dim_bs, madrl_args.hidden_dim, action_dim_bs, 
                     bs_action_low, bs_action_high,
                     madrl_args.actor_lr, madrl_args.critic_lr, madrl_args.lmbda, 
-                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.num_episodes, device,
+                    madrl_args.eps, madrl_args.gamma, madrl_args.epochs, madrl_args.episodes, device,
                     policy_dist = "Beta", entropy_coef = 0.01)
     
     running_norm_bs = Normalization(state_dim_bs)  # 为每个 agent 各建一个动态归一化状态空间
