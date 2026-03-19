@@ -20,7 +20,7 @@ def get_base_args():
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
     base_parser.add_argument("--targets_num", type=int, default=8, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=8, help="UAV 数量")
-    base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
+    base_parser.add_argument("--cus_num", type=int, default=16, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
     base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
 
@@ -46,8 +46,8 @@ def get_base_args():
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
     base_parser.add_argument("--cu_max_power_dbm", type=float, default=23, help="CU 最大发射功率 (dBm)")
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
-    base_parser.add_argument("--cu_max_delay", type=float, default=0.5, help="娱乐任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
+    base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
+    base_parser.add_argument("--uav_max_delay", type=float, default=0.3, help="感知任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
@@ -471,10 +471,10 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     # ==============================
     for i in range(args.uavs_num):
         obj_fun -= omega_weight_1 * kappa * (
-            args.bs_cycles_per_bit * args.uav_sen_duration * (hat_auxiliary_variable_z[i] ** 2) / 2
-            + args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i]) ** 4 * (args.freq_scale ** 4)) / 2
-            + args.bs_cycles_per_bit * args.uav_sen_duration * hat_auxiliary_variable_z[i] * (var_auxiliary_variable_z[i] - hat_auxiliary_variable_z[i])
-            + 2 * args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i]) ** 3 * (args.freq_scale ** 3)) * ((var_bs_2_uav_freqs_norm[i] - hat_bs_2_uav_freqs_norm[i]) * args.freq_scale)
+            args.bs_cycles_per_bit * args.uav_sen_duration * (hat_auxiliary_variable_z[i].value ** 2) / 2
+            + args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i].value) ** 4 * (args.freq_scale ** 4)) / 2
+            + args.bs_cycles_per_bit * args.uav_sen_duration * hat_auxiliary_variable_z[i].value * (var_auxiliary_variable_z[i] - hat_auxiliary_variable_z[i].value)
+            + 2 * args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i].value) ** 3 * (args.freq_scale ** 3)) * ((var_bs_2_uav_freqs_norm[i] - hat_bs_2_uav_freqs_norm[i].value) * args.freq_scale)
         )
 
     # ==============================
@@ -482,17 +482,17 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     # ==============================
     for i in range(args.uavs_num):
         # 计算感知波束最大特征值对应的特征向量
-        v_w = compute_largest_eigenvector(hat_uav_sen_beams[i])
+        v_w = compute_largest_eigenvector(hat_uav_sen_beams[i].value)
         # 计算卸载波束最大特征值对应的特征向量
-        v_b = compute_largest_eigenvector(hat_uav_off_beams[i])
+        v_b = compute_largest_eigenvector(hat_uav_off_beams[i].value)
         v_w_matrix = np.outer(v_w, np.conj(v_w))
         v_b_matrix = np.outer(v_b, np.conj(v_b))
 
-        obj_fun += cur_penalty_factor * (
-            cp.real(cp.trace(var_uavs_sen_beam[i])) - np.linalg.norm(hat_uav_sen_beams[i], 2)
-            + cp.real(cp.trace(var_uavs_off_beam[i])) - np.linalg.norm(hat_uav_off_beams[i], 2)
-            - cp.real(cp.trace(v_w_matrix  @ (var_uavs_sen_beam[i] - hat_uav_sen_beams[i])))
-            - cp.real(cp.trace(v_b_matrix @ (var_uavs_off_beam[i] -  hat_uav_off_beams[i])))
+        obj_fun += cur_penalty_factor.value * (
+            cp.real(cp.trace(var_uavs_sen_beam[i])) - np.linalg.norm(hat_uav_sen_beams[i].value, 2)
+            + cp.real(cp.trace(var_uavs_off_beam[i])) - np.linalg.norm(hat_uav_off_beams[i].value, 2)
+            - cp.real(cp.trace(v_w_matrix  @ (var_uavs_sen_beam[i] - hat_uav_sen_beams[i].value)))
+            - cp.real(cp.trace(v_b_matrix @ (var_uavs_off_beam[i] -  hat_uav_off_beams[i].value)))
         )
     return obj_fun
 
@@ -754,7 +754,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     for i in range(I):
         A_i     = matched_uav_sensing_channel[i]                # A(θ_i)，shape (N, N)
         Delta_i = Delta_list[i]                                 # Δ_i，shape (N, N)
-        hat_W_i = hat_uav_sen_beams[i]                         # W^(n)_i，shape (N, N)
+        hat_W_i = hat_uav_sen_beams[i].value                    # W^(n)_i，shape (N, N)
 
         # Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
         # 加上 reg 对角正则化
@@ -825,7 +825,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
                 Psi_j1_n += (
                     eta_ij                                       # η_{i,j}
                     * float(np.real(np.trace(
-                        H_ui_BS_list[i] @ hat_uav_sen_beams[i]  # Tr(H_{u_i,BS} W^(n)_i)
+                        H_ui_BS_list[i] @ hat_uav_sen_beams[i].value  # Tr(H_{u_i,BS} W^(n)_i)
                     )))
                 )
 
@@ -837,7 +837,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
                 Psi_j2_n += (
                     eta_ij                                       # η_{i,j}
                     * float(np.real(np.trace(
-                        H_ui_BS_list[i] @ hat_uav_off_beams[i]  # Tr(H_{u_i,BS} B^(n)_i)
+                        H_ui_BS_list[i] @ hat_uav_off_beams[i].value  # Tr(H_{u_i,BS} B^(n)_i)
                     )))
                 )
 
@@ -874,7 +874,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
                 tr_H_Wi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_sen_beam[i]))
-                tr_H_hatWi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i])))
+                tr_H_hatWi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
                 sum_eta_tr_H_dW = (
                     sum_eta_tr_H_dW
                     + eta_ij * (tr_H_Wi - tr_H_hatWi)           # η_{i,j} Tr(H (W_i - W^(n)_i))
@@ -886,7 +886,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
                 tr_H_Bi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_off_beam[i]))
-                tr_H_hatBi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i])))
+                tr_H_hatBi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
                 sum_eta_tr_H_dB = (
                     sum_eta_tr_H_dB
                     + eta_ij * (tr_H_Bi - tr_H_hatBi)           # η_{i,j} Tr(H (B_i - B^(n)_i))
@@ -1125,76 +1125,81 @@ def penalty_based_cccp(args,
     var_cus_off_duration = cp.Variable(args.cus_num, nonneg=True)
     var_t = cp.Variable(args.uavs_num, nonneg=True)  # 辅助变量 t 是为了保障满足 DCP, 该变量没有在文中使用
     # 声明初始值
-    hat_auxiliary_variable_z = np.ones(args.uavs_num) * 3e5
-    hat_bs_2_uav_freqs_norm = np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num)
-    hat_uav_sen_beams, hat_uav_off_beams = initialize_uav_beams(args = args,
+    hat_auxiliary_variable_z = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * 3e5)
+    hat_bs_2_uav_freqs_norm = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num))
+    hat_uav_sen_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    hat_uav_off_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    temp_hat_uav_sen_beams, temp_hat_uav_off_beams = initialize_uav_beams(args = args,
                                                                 matched_uav_sensing_channel = matched_uav_sensing_channel,
                                                                 uavs_2_bs_channels = uavs_2_bs_channels
                                                                 )
-    # 罚因子和缩放系数
-    cur_penalty_factor = args.penalty_factor
+    for i in range(args.uavs_num):
+        hat_uav_sen_beams[i].value = temp_hat_uav_sen_beams[i]
+        hat_uav_off_beams[i].value = temp_hat_uav_off_beams[i]
 
+    # 定义罚因子
+    cur_penalty_factor = cp.Parameter(nonneg=True, value=args.penalty_factor)
+    
     print("-------------------------------------------------------- ")
     print(f"-------------------- CCCP算法开始迭代 -------------------- ")
     print("-------------------------------------------------------- ")
     iter_count = 0  # 记录迭代次数
     # infeasible_probe_done = False  # 在问题求解为 infeasible 的时候记录是否已经完成了一次不可行性检验
+    pre_obj_fun_val = float('inf')
+    
+    # 定义目标函数
+    obj_fun = compute_obj_fun(args = args,
+                            var_uavs_sen_beam = var_uavs_sen_beam,
+                            var_uavs_off_beam = var_uavs_off_beam,
+                            var_bs_2_uav_freqs_norm = var_bs_2_uav_freqs_norm,
+                            var_auxiliary_variable_z = var_auxiliary_variable_z,
+                            var_cus_off_duration = var_cus_off_duration,
+                            var_t = var_t,
+                            hat_auxiliary_variable_z = hat_auxiliary_variable_z,
+                            hat_bs_2_uav_freqs_norm = hat_bs_2_uav_freqs_norm,
+                            hat_uav_sen_beams = hat_uav_sen_beams,
+                            hat_uav_off_beams = hat_uav_off_beams,
+                            cus_entertaining_task_size = cus_entertaining_task_size,
+                            uavs_off_duration = uavs_off_duration,
+                            cus_off_power = cus_off_power,
+                            uavs_pos_pre = uavs_pos_pre,
+                            uavs_pos_cur = uavs_pos_cur,
+                            cur_penalty_factor = cur_penalty_factor
+                            )
+    all_constraints = define_constraint(args=args,
+                                        var_uavs_sen_beam=var_uavs_sen_beam,
+                                        var_uavs_off_beam=var_uavs_off_beam,
+                                        var_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm,
+                                        var_auxiliary_variable_z=var_auxiliary_variable_z,
+                                        var_cus_off_duration=var_cus_off_duration,
+                                        var_t=var_t,
+                                        hat_uav_sen_beams=hat_uav_sen_beams,
+                                        hat_uav_off_beams=hat_uav_off_beams,
+                                        cus_entertaining_task_size=cus_entertaining_task_size,
+                                        uavs_off_duration=uavs_off_duration,
+                                        cus_off_power=cus_off_power,
+                                        matched_uav_sensing_channel=matched_uav_sensing_channel,
+                                        uavs_2_cus_channels=uavs_2_cus_channels,
+                                        uavs_2_bs_channels=uavs_2_bs_channels,
+                                        cus_2_bs_channels=cus_2_bs_channels,
+                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix)
 
+    constraint_map = build_constraint_map(args, all_constraints)
+    include_groups = parse_group_list(args.constraint_include_groups)
+    exclude_groups = parse_group_list(args.constraint_exclude_groups)
+    constraints, active_groups = select_constraints(constraint_map,
+                                                    include_groups=include_groups,
+                                                    exclude_groups=exclude_groups)
+    print(f"启用约束组: {active_groups}")
+    # NOTE - 定义为 DPP 问题，加速求解
+    problem = cp.Problem(cp.Minimize(obj_fun), constraints)
+        
     for outer_iter in range(args.max_iterations):
-        pre_obj_fun_val = float('inf')
-        rank1_gap_max = float('inf')
-        print(f"-------------------- 外层 {outer_iter + 1} 轮, rho = {cur_penalty_factor:.4e} --------------------")
+        print(f"-------------------- 外层 {outer_iter + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
         # 固定罚因子，求解问题
         for inner_iter in range(args.max_iterations):
-            # 定义目标函数
-            obj_fun = compute_obj_fun(args = args,
-                                    var_uavs_sen_beam = var_uavs_sen_beam,
-                                    var_uavs_off_beam = var_uavs_off_beam,
-                                    var_bs_2_uav_freqs_norm = var_bs_2_uav_freqs_norm,
-                                    var_auxiliary_variable_z = var_auxiliary_variable_z,
-                                    var_cus_off_duration = var_cus_off_duration,
-                                    var_t = var_t,
-                                    hat_auxiliary_variable_z = hat_auxiliary_variable_z,
-                                    hat_bs_2_uav_freqs_norm = hat_bs_2_uav_freqs_norm,
-                                    hat_uav_sen_beams = hat_uav_sen_beams,
-                                    hat_uav_off_beams = hat_uav_off_beams,
-                                    cus_entertaining_task_size = cus_entertaining_task_size,
-                                    uavs_off_duration = uavs_off_duration,
-                                    cus_off_power = cus_off_power,
-                                    uavs_pos_pre = uavs_pos_pre,
-                                    uavs_pos_cur = uavs_pos_cur,
-                                    cur_penalty_factor = cur_penalty_factor
-                                    )
-            all_constraints = define_constraint(args=args,
-                                                var_uavs_sen_beam=var_uavs_sen_beam,
-                                                var_uavs_off_beam=var_uavs_off_beam,
-                                                var_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm,
-                                                var_auxiliary_variable_z=var_auxiliary_variable_z,
-                                                var_cus_off_duration=var_cus_off_duration,
-                                                var_t=var_t,
-                                                hat_uav_sen_beams=hat_uav_sen_beams,
-                                                hat_uav_off_beams=hat_uav_off_beams,
-                                                cus_entertaining_task_size=cus_entertaining_task_size,
-                                                uavs_off_duration=uavs_off_duration,
-                                                cus_off_power=cus_off_power,
-                                                matched_uav_sensing_channel=matched_uav_sensing_channel,
-                                                uavs_2_cus_channels=uavs_2_cus_channels,
-                                                uavs_2_bs_channels=uavs_2_bs_channels,
-                                                cus_2_bs_channels=cus_2_bs_channels,
-                                                uavs_cus_matched_matrix=uavs_cus_matched_matrix)
-
-            constraint_map = build_constraint_map(args, all_constraints)
-            include_groups = parse_group_list(args.constraint_include_groups)
-            exclude_groups = parse_group_list(args.constraint_exclude_groups)
-            constraints, active_groups = select_constraints(constraint_map,
-                                                            include_groups=include_groups,
-                                                            exclude_groups=exclude_groups)
-            if outer_iter == 0 and inner_iter == 0:
-                print(f"启用约束组: {active_groups}")
-
-            problem = cp.Problem(cp.Minimize(obj_fun), constraints)
-             
-            problem.solve(solver=cp.SCS)
+            # NOTE - DPP 问题，内层求解
+            problem.solve(solver=cp.SCS, warm_start=True)
             iter_count += 1
 
             print(f"总第 {iter_count} 轮（外层 {outer_iter + 1} / 内层 {inner_iter + 1}）迭代状态:", problem.status)
@@ -1224,7 +1229,7 @@ def penalty_based_cccp(args,
                     cus_off_power=cus_off_power,
                     uavs_pos_pre=uavs_pos_pre,
                     uavs_pos_cur=uavs_pos_cur,
-                    cur_penalty_factor=cur_penalty_factor
+                    cur_penalty_factor=cur_penalty_factor.value
                 )
                 # cur_pure_energy_val = compute_pure_energy_value(
                 #     args=args,
@@ -1259,15 +1264,22 @@ def penalty_based_cccp(args,
                 # print(f"Convergency!!! - 第 {iter_count + 1} 轮辅助变量 z = {var_auxiliary_variable_z.value}" )
                 # print(f"Convergency!!! - 第 {iter_count + 1} 轮 CU 卸载持续时长 = {var_cus_off_duration.value}" )
                 # print(f"Convergency!!! - 第 {iter_count + 1} 轮辅助变量 t = {var_t.value * (args.freq_scale ** 2)}" )
-
-                inner_converged = True
+                # 更新参数值
+                for i in range(args.uavs_num):
+                    hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
+                    hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
+                hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
+                hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+                 # 更新当前目标函数值
+                pre_obj_fun_val = cur_original_obj_fun_val
                 break
 
-            # 下一轮迭代赋值
-            hat_uav_sen_beams = [v.value for v in var_uavs_sen_beam]
-            hat_uav_off_beams = [v.value for v in var_uavs_off_beam]
-            hat_auxiliary_variable_z = var_auxiliary_variable_z.value
-            hat_bs_2_uav_freqs_norm = var_bs_2_uav_freqs_norm.value
+            # NOTE - 更新 DPP 问题的变化量
+            for i in range(args.uavs_num):
+                hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
+                hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
+            hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
+            hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
             # 更新当前目标函数值（原始目标函数值）
             pre_obj_fun_val = cur_original_obj_fun_val
 
@@ -1278,7 +1290,7 @@ def penalty_based_cccp(args,
             rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
 
         # 更新罚因子
-        cur_penalty_factor *= args.zoom_factor  
+        cur_penalty_factor.value *= args.zoom_factor  
         
         # 如果满足了 rank1 的门限，则提前退出
         if rank1_gap_max < args.rank1_threshold:
