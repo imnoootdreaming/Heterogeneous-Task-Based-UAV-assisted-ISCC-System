@@ -65,10 +65,14 @@ class MyEnv(gym.Env):
                                     ref_path_loss = db_2_watt(base_args.ref_path_loss_db)  # 1m 下参考路径损耗
                                     )  # 计算感知信道响应矩阵
         
+        self.target_sensed_mask = np.zeros(self.base_args.targets_num, dtype=bool)
         self.uavs_targets_matched_matrix \
-        = self.match_uav_targets_nearest(uavs_pos = self.init_uavs_pos,
+            = self.match_uav_targets_nearest(uavs_pos = self.init_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
+        # 重要：更新掩码，标记这些目标在未来时隙不再可用 [事实]
+        matched_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
+        self.target_sensed_mask[matched_indices] = True
         # -------- 初始化信道矩阵 --------
         
         # -------- 定义动作空间 --------
@@ -112,7 +116,6 @@ class MyEnv(gym.Env):
         
         # -------- 定义状态空间 --------
         self.observation_space = {}
-
         # UAV 观测空间
         # 1. UAV i 的坐标
         # 2. UAV <==> BS 的信道 (real + imag 实部 + 虚部)
@@ -233,9 +236,12 @@ class MyEnv(gym.Env):
                                     )  # 计算感知信道响应矩阵
 
         self.uavs_targets_matched_matrix \
-            = match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+            = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
+        # 重要：更新掩码，标记这些目标在未来时隙不再可用 [事实]
+        matched_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
+        self.target_sensed_mask[matched_indices] = True
 
         next_state_dict = {"uav": {}, "bs": None}
 
@@ -276,7 +282,7 @@ class MyEnv(gym.Env):
         # 初始化到最初状态
         # init_cur_uav_pos: 初始 UAV 坐标
         # init_user_pos: 初始化用户坐标
-        #
+        self.target_sensed_mask = np.zeros(self.base_args.targets_num, dtype=bool)
         # 恢复初始 UAV 和用户位置
         self.cur_uav_pos = self.init_uavs_pos.copy()
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()  # 读取轨迹的初始点
@@ -302,9 +308,12 @@ class MyEnv(gym.Env):
                                     )  # 计算感知信道响应矩阵
 
         self.uavs_targets_matched_matrix \
-        = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
+            = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
+        # 找到本次匹配的目标索引并标记为已感知
+        matched_target_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
+        self.target_sensed_mask[matched_target_indices] = True
         # 初始化观测空间 init_state_dict
         # UAV 观测空间
         # 1. UAV i 的坐标
@@ -512,27 +521,30 @@ class MyEnv(gym.Env):
 
 
     def match_uav_targets_nearest(self, uavs_pos, targets_pos):
-        """
-        根据距离最近原则，对 UAVs 和 targets 进行一一匹配
-        (使用匈牙利算法最小化总距离)
-
-        :param uavs_pos: UAVs 的位置 (I * 3)
-        :param targets_pos: targets 的位置 (J * 3)
-        :return: UAVs 和 targets 的匹配矩阵 (I * J)
-        """
         num_uavs = uavs_pos.shape[0]
         num_targets = targets_pos.shape[0]
         uavs_targets_matched_matrix = np.zeros((num_uavs, num_targets))
         
-        # 计算距离矩阵
-        diff = uavs_pos[:, np.newaxis, :] - targets_pos[np.newaxis, :, :]
+        # 1. 找到尚未被感知的目标索引 [推断: 保证不重复感知]
+        available_indices = np.where(~self.target_sensed_mask)[0]
+        
+        # 健壮性检查：如果剩余目标不足，则 fallback 到全体目标（或根据业务逻辑处理）
+        if len(available_indices) < num_uavs:
+            available_indices = np.arange(num_targets)
+
+        # 2. 仅计算 UAV 与 “可用目标” 之间的距离矩阵
+        # diff shape: (num_uavs, len(available_indices), 3)
+        diff = uavs_pos[:, np.newaxis, :] - targets_pos[available_indices][np.newaxis, :, :]
         dist_matrix = np.linalg.norm(diff, axis=2)
         
-        # 使用匈牙利算法求解最小权匹配 (距离之和最小)
+        # 3. 匈牙利算法求解最小距离匹配
         row_ind, col_ind = linear_sum_assignment(dist_matrix)
         
+        # 4. 将子矩阵的列索引映射回原始 targets_pos 的全局索引
+        actual_target_indices = available_indices[col_ind]
+        
         # 设置匹配矩阵
-        uavs_targets_matched_matrix[row_ind, col_ind] = 1
+        uavs_targets_matched_matrix[row_ind, actual_target_indices] = 1
         
         return uavs_targets_matched_matrix
 
