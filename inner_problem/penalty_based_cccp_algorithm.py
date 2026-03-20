@@ -68,12 +68,12 @@ def get_base_args():
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
 
     # 基于惩罚的 CCCP 算法参数
-    base_parser.add_argument("--max_iterations", type=int, default=50, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--max_iterations", type=int, default=15, help="CCCP 算法最大迭代次数")
     base_parser.add_argument("--cccp_threshold", type=float, default=1e-6, help="CCCP 算法目标函数收敛阈值")
     base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
-    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
+    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45，auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
     return base_parser.parse_args()
@@ -481,13 +481,14 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
         A_i = matched_uav_sensing_channel[i]
         Delta_i = Delta_list[i]
         hat_W_i = hat_uav_sen_beams[i].value
-        Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T) + 1e-6 * np.eye(N)
+        Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T)
         _, logdet_Delta_i = np.linalg.slogdet(Delta_i)
         _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n)
         AH_Psiinv_A = A_i.conj().T @ np.linalg.inv(Psi_i_n) @ A_i
         grad_mat = (xi1 * xi2 / np.log(2)) * AH_Psiinv_A
         c44_grad_mats[i].value = (grad_mat + grad_mat.conj().T) / 2
-        c44_const_terms.value[i] = float(-xi1 * (logdet_Delta_i / np.log(2)) + xi1 * (logdet_Psi_i_n / np.log(2)))
+        tr_grad_W = np.real(np.trace(c44_grad_mats[i].value @ hat_W_i))
+        c44_const_terms.value[i] = float(-xi1 * (logdet_Delta_i / np.log(2)) + xi1 * (logdet_Psi_i_n / np.log(2))) - float(tr_grad_W)
 
     for j in range(J):
         sum_eta_ij_D_sen = D_sen * float(np.sum(uavs_cus_matched_matrix[:, j]))
@@ -499,9 +500,8 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
             if eta_ij > 0:
                 Psi_j1_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
                 Psi_j2_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
-        psi_floor = max(sigma_2 * 100, 1e-8)
-        Psi_j1_n_safe = max(float(np.real(Psi_j1_n)), psi_floor)
-        Psi_j2_n_safe = max(float(np.real(Psi_j2_n)), psi_floor)
+        Psi_j1_n_safe = float(np.real(Psi_j1_n))
+        Psi_j2_n_safe = float(np.real(Psi_j2_n))
         c45_term4_const.value[j] = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n_safe)
         c45_term5_const.value[j] = sum_eta_ij_D_off * B * np.log2(Psi_j2_n_safe)
 
@@ -612,7 +612,8 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
                 - cp.real(cp.trace(v_b_scaled_matrix @ var_uavs_off_beam[i]))
                 + rank1_const_terms[i]
             )
-            obj_fun += cp.pos(rank1_penalty_gap)
+            # obj_fun += cp.pos(rank1_penalty_gap)
+            obj_fun += rank1_penalty_gap
     
     return obj_fun
 
@@ -1025,6 +1026,94 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     return constraints
 
 
+def parse_group_list(group_text):
+    """
+    解析约束组列表字符串，返回约束组名称列表。
+    约束组名称列表中的每个元素为一个字符串，代表一个约束组。
+    约束组名称列表中的元素顺序与约束组在问题 P6 中的顺序一致。
+    """
+    if group_text is None:
+        return None
+    group_text = str(group_text).strip()
+    if group_text == "":
+        return None
+    # 以","进行输入故以逗号进行分割
+    return [item.strip() for item in group_text.split(",") if item.strip()]
+
+
+def build_constraint_map(args, constraints):
+    I = args.uavs_num
+    J = args.cus_num
+    idx = 0
+    constraint_map = {}
+    constraint_map["4.5"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.12"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.23"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.25"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.27"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.28"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.29"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.32"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.39"] = constraints[idx:idx + J]
+    idx += J
+    constraint_map["4.40"] = constraints[idx:idx + 1]
+    idx += 1
+    constraint_map["4.44"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["4.45"] = constraints[idx:idx + J]
+    idx += J
+    constraint_map["auxiliary_t"] = constraints[idx:idx + I]
+    idx += I
+    constraint_map["var"] = constraints[idx:idx + I * 3 + J]
+    return constraint_map
+
+
+def select_constraints(constraint_map, include_groups=None, exclude_groups=None):
+    all_groups = list(constraint_map.keys())
+    unknown_include = [] if include_groups is None else [g for g in include_groups if g not in constraint_map]
+    unknown_exclude = [] if exclude_groups is None else [g for g in exclude_groups if g not in constraint_map]
+    if len(unknown_include) > 0 or len(unknown_exclude) > 0:
+        raise ValueError(f"未知约束组 include={unknown_include}, exclude={unknown_exclude}, 可选组={all_groups}")
+
+    active_groups = all_groups if include_groups is None else [g for g in all_groups if g in include_groups]
+    if exclude_groups is not None:
+        active_groups = [g for g in active_groups if g not in exclude_groups]
+
+    selected_constraints = []
+    for group in active_groups:
+        selected_constraints.extend(constraint_map[group])
+    return selected_constraints, active_groups
+
+
+def probe_group_feasibility(constraint_map, active_groups, solver):
+    """
+    问题的可行性检验
+    
+    :param constraint_map: 约束组 map 集合，key 为约束组名称，value 为约束列表
+    :param active_groups: 活动约束组名称列表
+    :param solver: 优化求解器
+    :return: 每个约束组的可行性检验结果列表，每个元素为 (约束组名称, 求解状态)
+    """
+    cumulative_constraints = []
+    probe_rows = []
+    for group in active_groups:
+        cumulative_constraints.extend(constraint_map[group])
+        probe_problem = cp.Problem(cp.Minimize(0), cumulative_constraints)
+        probe_problem.solve(solver=solver, warm_start=False)
+        probe_rows.append((group, probe_problem.status))
+        if probe_problem.status in ("infeasible", "infeasible_inaccurate"):
+            break
+    return probe_rows
+
+
 def penalty_based_cccp(args,
                        uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
                        uavs_targets_matched_matrix, uavs_cus_matched_matrix,
@@ -1169,94 +1258,84 @@ def penalty_based_cccp(args,
                                         c45_coef_b=c45_coef_b,
                                         c45_const_w=c45_const_w,
                                         c45_const_b=c45_const_b)
+    constraint_map = build_constraint_map(args, all_constraints)
+    include_groups = parse_group_list(args.constraint_include_groups)
+    exclude_groups = parse_group_list(args.constraint_exclude_groups)
+    constraints, active_groups = select_constraints(constraint_map,
+                                                    include_groups=include_groups,
+                                                    exclude_groups=exclude_groups)
+    # print(f"启用约束组: {active_groups}")
     # NOTE - 定义为 DPP，加速求解
-    problem = cp.Problem(cp.Minimize(obj_fun), all_constraints)
+    problem = cp.Problem(cp.Minimize(obj_fun), constraints)
     # print(f"是否定义为 DPP : {problem.is_dcp(dpp=True)}")  # 检测是否为 DPP
-    pre_original_obj_fun_val = float('inf')
     rank1_gap_max = float('inf')
     energy_val_list = []
     rank1_val_list = []
-    for iter in range(args.max_iterations):
-        print(f"-------------------- 第 {iter + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
-        # start_time = time.time()
-        problem.solve(solver=cp.MOSEK, warm_start=True)
-        # end_time = time.time()
-        # print(f"第 {inner_iter + 1} 轮迭代耗时: {end_time - start_time:.4f} 秒")
-        iter_count += 1
-        if problem.status in ("infeasible", "infeasible_inaccurate"):
-            print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
-            return float('inf'), iter_count
-        elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
-            # cur_original_obj_fun_val = compute_original_obj_fun_value(
-            #     args=args,
-            #     cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
-            #     cur_uavs_off_beams=[v.value for v in var_uavs_off_beam],
-            #     cur_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
-            #     cur_auxiliary_variable_z=var_auxiliary_variable_z.value,
-            #     cur_cus_off_duration=var_cus_off_duration.value,
-            #     cus_entertaining_task_size=cus_entertaining_task_size,
-            #     uavs_off_duration=uavs_off_duration,
-            #     cus_off_power=cus_off_power,
-            #     uavs_pos_pre=uavs_pos_pre,
-            #     uavs_pos_cur=uavs_pos_cur,
-            #     cur_penalty_factor=cur_penalty_factor.value,
-            #     use_penalty_rank1=use_penalty_rank1
-            # )
-            cur_pure_energy_val = compute_pure_energy_value(
-                args=args,
-                cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
-                cur_uavs_off_beams=[v.value for v in var_uavs_off_beam],
-                cur_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
-                cur_auxiliary_variable_z=var_auxiliary_variable_z.value,
-                cur_cus_off_duration=var_cus_off_duration.value,
-                cus_entertaining_task_size=cus_entertaining_task_size,
-                uavs_off_duration=uavs_off_duration,
-                cus_off_power=cus_off_power,
-                uavs_pos_pre=uavs_pos_pre,
-                uavs_pos_cur=uavs_pos_cur
-            )
-            cur_opt_energy_val = problem.value
-            print(f"第 {iter + 1} 轮求解的问题的 VALUE 值:", cur_opt_energy_val, f"当前状态 : {problem.status}")
-            # print(f"第 {iter + 1} 轮 CCCP 迭代问题函数值:", cur_original_obj_fun_val)
-            print(f"第 {iter + 1} 轮不考虑罚函数下的纯能耗值:", cur_pure_energy_val)
-        # 更新线性化参数
-        for i in range(args.uavs_num):
-            hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
-            hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
-        hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
-        hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
-        # 计算最大 rank1 gap
-        rank1_gap_max = 0.0
-        for i in range(args.uavs_num):
-            w_gap = np.real(np.trace(var_uavs_sen_beam[i].value)) - np.linalg.norm(var_uavs_sen_beam[i].value, 2)
-            b_gap = np.real(np.trace(var_uavs_off_beam[i].value)) - np.linalg.norm(var_uavs_off_beam[i].value, 2)
-            rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
-        print(f"第 {iter + 1} 轮最大 rank1 gap:", rank1_gap_max)
-        # 记录能耗值和 rank1 gap
-        energy_val_list.append(cur_pure_energy_val)
-        rank1_val_list.append(rank1_gap_max)
+    cur_opt_energy_val = float('inf')
+    for outer_iter in range(args.max_iterations):
+        pre_penalized_obj_val = float('inf')
+        for inner_iter in range(args.max_iterations):
+            print(f"-------------------- 第 {iter_count + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
+            problem.solve(solver=cp.MOSEK, warm_start=True)
+            iter_count += 1
+            if problem.status in ("infeasible", "infeasible_inaccurate"):
+                print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
+                return float('inf'), iter_count
+            elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
+                cur_pure_energy_val = compute_pure_energy_value(
+                    args=args,
+                    cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
+                    cur_uavs_off_beams=[v.value for v in var_uavs_off_beam],
+                    cur_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
+                    cur_auxiliary_variable_z=var_auxiliary_variable_z.value,
+                    cur_cus_off_duration=var_cus_off_duration.value,
+                    cus_entertaining_task_size=cus_entertaining_task_size,
+                    uavs_off_duration=uavs_off_duration,
+                    cus_off_power=cus_off_power,
+                    uavs_pos_pre=uavs_pos_pre,
+                    uavs_pos_cur=uavs_pos_cur
+                )
+                cur_opt_energy_val = problem.value
+                print(f"第 {iter_count} 轮求解的问题的 VALUE 值:", cur_opt_energy_val, f"当前状态 : {problem.status}")
+                print(f"第 {iter_count} 轮不考虑罚函数下的纯能耗值:", cur_pure_energy_val)
+            for i in range(args.uavs_num):
+                hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
+                hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
+            hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
+            hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+            rank1_gap_max = 0.0
+            for i in range(args.uavs_num):
+                w_gap = np.real(np.trace(var_uavs_sen_beam[i].value)) - np.linalg.norm(var_uavs_sen_beam[i].value, 2)
+                b_gap = np.real(np.trace(var_uavs_off_beam[i].value)) - np.linalg.norm(var_uavs_off_beam[i].value, 2)
+                rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
+            print(f"第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
+            energy_val_list.append(cur_opt_energy_val)
+            rank1_val_list.append(rank1_gap_max)
 
-        obj_fun_opt = cur_pure_energy_val
-        # 检查收敛条件
-        # if iter != 0 and abs(cur_opt_energy_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val) < args.cccp_threshold:
-        if iter != 0 and rank1_gap_max < args.rank1_threshold:
-            print(f" Convergency!!! - 第 {iter + 1} 轮不考虑罚函数下的纯能耗值:", cur_pure_energy_val)
-            print(f" Convergency!!! - 第 {iter + 1} 轮最大 rank1 gap:", rank1_gap_max)
+            obj_fun_opt = cur_opt_energy_val
+            if inner_iter != 0 and abs(cur_opt_energy_val - pre_penalized_obj_val) < args.cccp_threshold:
+                print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_opt_energy_val)
+                print(f" Convergency!!! - 第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
+                break
+            pre_penalized_obj_val = cur_opt_energy_val
+            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                    rank1_sen_proj_mats, rank1_off_proj_mats,
+                                                    cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                                    rank1_const_terms)
+            update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                                    obj5_coef_z, obj5_coef_f, obj5_const_terms)
+            update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                        matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                                        uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                                        c44_const_terms, c44_grad_mats,
+                                                        c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
+        if rank1_gap_max < args.rank1_threshold:
             break
-        # if rank1_gap_max > args.rank1_threshold:
-        #     cur_penalty_factor.value *= args.zoom_factor
-        # 更新线性化参数
+        cur_penalty_factor.value *= args.zoom_factor
         update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
-                                                rank1_sen_proj_mats, rank1_off_proj_mats,
-                                                cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
-                                                rank1_const_terms)
-        update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
-                                                obj5_coef_z, obj5_coef_f, obj5_const_terms)
-        update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
-                                                    matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
-                                                    uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
-                                                    c44_const_terms, c44_grad_mats,
-                                                    c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
+                                              rank1_sen_proj_mats, rank1_off_proj_mats,
+                                              cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                              rank1_const_terms)
 
     return obj_fun_opt, iter_count, energy_val_list, rank1_val_list
 
