@@ -405,18 +405,123 @@ def initialize_uav_beams(args, matched_uav_sensing_channel, uavs_2_bs_channels):
     return hat_uav_sen_beams, hat_uav_off_beams
 
 
-def update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats):
+def update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                          rank1_sen_proj_mats, rank1_off_proj_mats,
+                                          cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                          rank1_const_terms):
+    cur_rho = float(cur_penalty_factor.value)
     for i in range(args.uavs_num):
         v_w = compute_largest_eigenvector(hat_uav_sen_beams[i].value)
         v_b = compute_largest_eigenvector(hat_uav_off_beams[i].value)
         v_w_matrix = np.outer(v_w, np.conj(v_w))
         v_b_matrix = np.outer(v_b, np.conj(v_b))
-        rank1_sen_proj_mats[i].value = (v_w_matrix + v_w_matrix.conj().T) / 2
-        rank1_off_proj_mats[i].value = (v_b_matrix + v_b_matrix.conj().T) / 2
+        v_w_matrix = (v_w_matrix + v_w_matrix.conj().T) / 2
+        v_b_matrix = (v_b_matrix + v_b_matrix.conj().T) / 2
+        rank1_sen_proj_mats[i].value = v_w_matrix
+        rank1_off_proj_mats[i].value = v_b_matrix
+        rank1_sen_scaled_proj_mats[i].value = cur_rho * v_w_matrix
+        rank1_off_scaled_proj_mats[i].value = cur_rho * v_b_matrix
+        rank1_const_terms.value[i] = float(
+            cur_rho * (
+                - np.linalg.norm(hat_uav_sen_beams[i].value, 2)
+                - np.linalg.norm(hat_uav_off_beams[i].value, 2)
+                + np.real(np.trace(v_w_matrix @ hat_uav_sen_beams[i].value))
+                + np.real(np.trace(v_b_matrix @ hat_uav_off_beams[i].value))
+            )
+        )
+
+
+def update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                         obj5_coef_z, obj5_coef_f, obj5_const_terms):
+    alpha = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration
+    scale_4 = args.freq_scale ** 4
+    for i in range(args.uavs_num):
+        hat_z = float(hat_auxiliary_variable_z.value[i])
+        hat_f = float(hat_bs_2_uav_freqs_norm.value[i])
+        obj5_coef_z.value[i] = -alpha * hat_z
+        obj5_coef_f.value[i] = -alpha * 2.0 * (hat_f ** 3) * scale_4
+        obj5_const_terms.value[i] = alpha * (0.5 * (hat_z ** 2) + 1.5 * (hat_f ** 4) * scale_4)
+
+
+def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                               matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                               uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                               c44_const_terms, c44_grad_mats,
+                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b):
+    I = args.uavs_num
+    J = args.cus_num
+    N = args.antenna_nums
+    B = args.bandwidth
+    sigma_2 = dbm_2_watt(args.noise_power_density_dbm) * B
+    D_sen = args.uav_sen_duration
+    xi1 = args.radar_duty_ratio / (2.0 * args.radar_impulse_duration)
+    xi2 = (2.0 * args.var_range_fluctuation
+           * (args.radar_spectrum_shape ** 2)
+           * (args.bandwidth ** 3)
+           * args.radar_impulse_duration)
+
+    Delta_list = []
+    for i in range(I):
+        Delta_i = sigma_2 * np.eye(N, dtype=complex)
+        for j in range(J):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                h_ij = uavs_2_cus_channels[i, j, :]
+                Delta_i = Delta_i + eta_ij * cus_off_power[j] * np.outer(h_ij, np.conj(h_ij))
+        Delta_list.append(Delta_i)
+
+    H_ui_BS_list = []
+    for i in range(I):
+        h_i = uavs_2_bs_channels[i, 0, :]
+        H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))
+
+    for i in range(I):
+        A_i = matched_uav_sensing_channel[i]
+        Delta_i = Delta_list[i]
+        hat_W_i = hat_uav_sen_beams[i].value
+        Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T) + 1e-6 * np.eye(N)
+        _, logdet_Delta_i = np.linalg.slogdet(Delta_i)
+        _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n)
+        AH_Psiinv_A = A_i.conj().T @ np.linalg.inv(Psi_i_n) @ A_i
+        grad_mat = (xi1 * xi2 / np.log(2)) * AH_Psiinv_A
+        c44_grad_mats[i].value = (grad_mat + grad_mat.conj().T) / 2
+        c44_const_terms.value[i] = float(-xi1 * (logdet_Delta_i / np.log(2)) + xi1 * (logdet_Psi_i_n / np.log(2)))
+
+    for j in range(J):
+        sum_eta_ij_D_sen = D_sen * float(np.sum(uavs_cus_matched_matrix[:, j]))
+        sum_eta_ij_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
+        Psi_j1_n = sigma_2
+        Psi_j2_n = sigma_2
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                Psi_j1_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
+                Psi_j2_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
+        psi_floor = max(sigma_2 * 100, 1e-8)
+        Psi_j1_n_safe = max(float(np.real(Psi_j1_n)), psi_floor)
+        Psi_j2_n_safe = max(float(np.real(Psi_j2_n)), psi_floor)
+        c45_term4_const.value[j] = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n_safe)
+        c45_term5_const.value[j] = sum_eta_ij_D_off * B * np.log2(Psi_j2_n_safe)
+
+        coef_w_j = B * sum_eta_ij_D_sen / (np.log(2) * Psi_j1_n_safe) if sum_eta_ij_D_sen > 0 else 0.0
+        coef_b_j = B * sum_eta_ij_D_off / (np.log(2) * Psi_j2_n_safe) if sum_eta_ij_D_off > 0 else 0.0
+        tr_hat_w_sum = 0.0
+        tr_hat_b_sum = 0.0
+        for i in range(I):
+            eta_ij = uavs_cus_matched_matrix[i, j]
+            if eta_ij > 0:
+                tr_hat_w_sum += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
+                tr_hat_b_sum += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
+        c45_coef_w.value[j] = coef_w_j
+        c45_coef_b.value[j] = coef_b_j
+        c45_const_w.value[j] = -coef_w_j * tr_hat_w_sum
+        c45_const_b.value[j] = -coef_b_j * tr_hat_b_sum
 
 
 def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs_norm, var_auxiliary_variable_z, var_cus_off_duration, var_t,
-                    hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats, cus_entertaining_task_size,
+                    hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm, hat_uav_sen_beams, hat_uav_off_beams,
+                    rank1_sen_proj_mats, rank1_off_proj_mats, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats, rank1_const_terms,
+                    obj5_coef_z, obj5_coef_f, obj5_const_terms, cus_entertaining_task_size,
                     uavs_off_duration, cus_off_power, uavs_pos_pre, uavs_pos_cur, cur_penalty_factor, use_penalty_rank1):
 
     obj_fun = 0
@@ -481,11 +586,10 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     # 第五项 CCCP 线性化
     # ==============================
     for i in range(args.uavs_num):
-        obj_fun -= omega_weight_1 * kappa * (
-            args.bs_cycles_per_bit * args.uav_sen_duration * (hat_auxiliary_variable_z[i] ** 2) / 2
-            + args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i]) ** 4 * (args.freq_scale ** 4)) / 2
-            + args.bs_cycles_per_bit * args.uav_sen_duration * hat_auxiliary_variable_z[i] * (var_auxiliary_variable_z[i] - hat_auxiliary_variable_z[i])
-            + 2 * args.bs_cycles_per_bit * args.uav_sen_duration * ((hat_bs_2_uav_freqs_norm[i]) ** 3 * (args.freq_scale ** 3)) * ((var_bs_2_uav_freqs_norm[i] - hat_bs_2_uav_freqs_norm[i]) * args.freq_scale)
+        obj_fun += (
+            obj5_coef_z[i] * var_auxiliary_variable_z[i]
+            + obj5_coef_f[i] * var_bs_2_uav_freqs_norm[i]
+            + obj5_const_terms[i]
         )
     
     # 采用 rank-1 惩罚项
@@ -494,15 +598,17 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
         # 第六项 rank-1 penalty
         # ==============================
         for i in range(args.uavs_num):
-            # DPP 架构，这里直接使用预计算好的 rank-1 投影矩阵
-            v_w_matrix = rank1_sen_proj_mats[i]
-            v_b_matrix = rank1_off_proj_mats[i]
+            v_w_scaled_matrix = rank1_sen_scaled_proj_mats[i]
+            v_b_scaled_matrix = rank1_off_scaled_proj_mats[i]
 
-            obj_fun += cur_penalty_factor * (
-                cp.real(cp.trace(var_uavs_sen_beam[i])) - cp.norm(hat_uav_sen_beams[i], 2)
-                + cp.real(cp.trace(var_uavs_off_beam[i])) - cp.norm(hat_uav_off_beams[i], 2)
-                - cp.real(cp.trace(v_w_matrix  @ (var_uavs_sen_beam[i] - hat_uav_sen_beams[i])))
-                - cp.real(cp.trace(v_b_matrix @ (var_uavs_off_beam[i] -  hat_uav_off_beams[i])))
+            obj_fun += (
+                cur_penalty_factor * (
+                    cp.real(cp.trace(var_uavs_sen_beam[i]))
+                    + cp.real(cp.trace(var_uavs_off_beam[i]))
+                )
+                - cp.real(cp.trace(v_w_scaled_matrix @ var_uavs_sen_beam[i]))
+                - cp.real(cp.trace(v_b_scaled_matrix @ var_uavs_off_beam[i]))
+                + rank1_const_terms[i]
             )
     
     return obj_fun
@@ -574,7 +680,8 @@ def compute_pure_energy_value(args, cur_uavs_sen_beams, cur_uavs_off_beams, cur_
 
 def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs_norm, var_auxiliary_variable_z, var_cus_off_duration, var_t,
                       hat_uav_sen_beams, hat_uav_off_beams, cus_entertaining_task_size, uavs_off_duration, cus_off_power, matched_uav_sensing_channel,
-                      uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_cus_matched_matrix):
+                      uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_cus_matched_matrix,
+                      c44_const_terms, c44_grad_mats, c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b):
     """
     定义问题 P6 的所有约束。
     每条约束均附有与论文公式一一对应的逐行注释，方便核对。
@@ -765,36 +872,10 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     #   其中 Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
     # =========================================================================
     for i in range(I):
-        A_i     = matched_uav_sensing_channel[i]                # A(θ_i)，shape (N, N)
-        Delta_i = Delta_list[i]                                 # Δ_i，shape (N, N)
-        hat_W_i = hat_uav_sen_beams[i].value                    # W^(n)_i，shape (N, N)
-
-        # Ψ^(n)_i = Δ_i + ξ2 · A(θ_i) · W^(n)_i · A^H(θ_i)
-        # 加上 reg 对角正则化
-        reg = 1e-6 * np.eye(N)
-        Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T) + reg
-
-        # log2 det(Δ_i)
-        _, logdet_Delta_i = np.linalg.slogdet(Delta_i)
-        log2_det_Delta_i  = logdet_Delta_i / np.log(2)
-
-        # log2 det(Ψ^(n)_i)
-        _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n)
-        log2_det_Psi_i_n  = logdet_Psi_i_n / np.log(2)
-
-        # A^H(θ_i) · (Ψ^(n)_i)^{-1} · A(θ_i)，shape (N, N)
-        Psi_i_n_inv = np.linalg.inv(Psi_i_n)
-        AH_Psiinv_A = A_i.conj().T @ Psi_i_n_inv @ A_i
-
         lhs_44 = (
-            - xi1 * log2_det_Delta_i                            # - ξ1 · log2det(Δ_i)
-            - var_auxiliary_variable_z[i]                       # - z_i
-            + xi1 * log2_det_Psi_i_n                           # + ξ1 · log2det(Ψ^(n)_i)
-            + xi1 * xi2 / np.log(2)                            # + ξ1 ξ2 / ln2
-              * cp.real(cp.trace(                               #   · Tr(
-                  AH_Psiinv_A                                   #       A^H (Ψ^(n))^{-1} A
-                  @ (var_uavs_sen_beam[i] - hat_W_i)            #       · (W_i - W^(n)_i)
-              ))                                                #     )
+            c44_const_terms[i]
+            - var_auxiliary_variable_z[i]
+            + cp.real(cp.trace(c44_grad_mats[i] @ var_uavs_sen_beam[i]))
         )
         constraints.append(lhs_44 <= 0)
 
@@ -829,31 +910,6 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         # log2(1 + p_j |h_{c_j,BS}|² / σ²)（常数）
         log2_cu_snr = np.log2(1.0 + p_j * h_cj_sq / sigma_2)
 
-        # ── 预计算 Ψ^(n)_{j,1} 和 Ψ^(n)_{j,2}（常数）────────────────────────
-        # Ψ^(n)_{j,1} = Σ_i η_{i,j} Tr(H_{u_i,BS} W^(n)_i) + σ²
-        Psi_j1_n = sigma_2                                      # 初始化为 σ²
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]              # η_{i,j}
-            if eta_ij > 0:
-                Psi_j1_n += (
-                    eta_ij                                       # η_{i,j}
-                    * float(np.real(np.trace(
-                        H_ui_BS_list[i] @ hat_uav_sen_beams[i].value  # Tr(H_{u_i,BS} W^(n)_i)
-                    )))
-                )
-
-        # Ψ^(n)_{j,2} = Σ_i η_{i,j} Tr(H_{u_i,BS} B^(n)_i) + σ²
-        Psi_j2_n = sigma_2                                      # 初始化为 σ²
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]              # η_{i,j}
-            if eta_ij > 0:
-                Psi_j2_n += (
-                    eta_ij                                       # η_{i,j}
-                    * float(np.real(np.trace(
-                        H_ui_BS_list[i] @ hat_uav_off_beams[i].value  # Tr(H_{u_i,BS} B^(n)_i)
-                    )))
-                )
-
         # ── 构建含优化变量的 CVXPY 表达式 ────────────────────────────────────
         # Σ_i η_{i,j} Tr(H_{u_i,BS} W_i)（含优化变量，用于 log 的参数）
         sum_eta_tr_H_W = 0.0
@@ -879,30 +935,6 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
                     * cp.real(cp.trace(                          # · Tr(H_{u_i,BS} B_i)
                         H_ui_BS_list[i] @ var_uavs_off_beam[i]
                     ))
-                )
-
-        # Σ_i η_{i,j} Tr(H_{u_i,BS} (W_i - W^(n)_i))（梯度修正，含优化变量）
-        sum_eta_tr_H_dW = 0.0
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]
-            if eta_ij > 0:
-                tr_H_Wi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_sen_beam[i]))
-                tr_H_hatWi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
-                sum_eta_tr_H_dW = (
-                    sum_eta_tr_H_dW
-                    + eta_ij * (tr_H_Wi - tr_H_hatWi)           # η_{i,j} Tr(H (W_i - W^(n)_i))
-                )
-
-        # Σ_i η_{i,j} Tr(H_{u_i,BS} (B_i - B^(n)_i))（梯度修正，含优化变量）
-        sum_eta_tr_H_dB = 0.0
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]
-            if eta_ij > 0:
-                tr_H_Bi    = cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_off_beam[i]))
-                tr_H_hatBi = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
-                sum_eta_tr_H_dB = (
-                    sum_eta_tr_H_dB
-                    + eta_ij * (tr_H_Bi - tr_H_hatBi)           # η_{i,j} Tr(H (B_i - B^(n)_i))
                 )
 
         # ── 逐项构建约束 (4.39) ───────────────────────────────────────────────
@@ -941,34 +973,16 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             * B * log2_cu_snr                                   # · B · log2(1 + p_j|h|²/σ²)
         )
 
-        # 数值保护：避免 Psi 因数值误差出现 <=0 导致 log2/div 警告
-        psi_floor = max(sigma_2 * 100, 1e-8)  # 给足裕量，防止系数爆炸
-        Psi_j1_n_safe = max(float(np.real(Psi_j1_n)), psi_floor)
-        Psi_j2_n_safe = max(float(np.real(Psi_j2_n)), psi_floor)
+        term_4 = c45_term4_const[j]
+        term_5 = c45_term5_const[j]
 
-        # 项④：+ Σ_i η D̄_sen · B · log2(Ψ^(n)_{j,1})（常数）
-        term_4 = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n_safe)      # Σ_i η D̄_sen · B · log2(Ψ^(n)_{j,1})
-
-        # 项⑤：+ Σ_i η D^off_{u_i} · B · log2(Ψ^(n)_{j,2})（常数）
-        term_5 = sum_eta_ij_D_off * B * np.log2(Psi_j2_n_safe)      # Σ_i η D^off · B · log2(Ψ^(n)_{j,2})
-
-        # 项⑥：+ B · Σ_i η D̄_sen / (ln2 · Ψ^(n)_{j,1}) · Σ_i η Tr(H (W_i - W^(n)_i))
-        if sum_eta_ij_D_sen > 0 and not isinstance(sum_eta_tr_H_dW, float):
-            term_6 = (
-                B * sum_eta_ij_D_sen                            # B · Σ_i η_{i,j} D̄_sen
-                / (np.log(2) * Psi_j1_n_safe)                       # / (ln2 · Ψ^(n)_{j,1})
-                * sum_eta_tr_H_dW                               # · Σ_i η Tr(H (W_i - W^(n)_i))
-            )
+        if sum_eta_ij_D_sen > 0 and not isinstance(sum_eta_tr_H_W, float):
+            term_6 = c45_coef_w[j] * sum_eta_tr_H_W + c45_const_w[j]
         else:
             term_6 = 0.0
 
-        # 项⑦：+ B · Σ_i η D^off_{u_i} / (ln2 · Ψ^(n)_{j,2}) · Σ_i η Tr(H (B_i - B^(n)_i))
-        if sum_eta_ij_D_off > 0 and not isinstance(sum_eta_tr_H_dB, float):
-            term_7 = (
-                B * sum_eta_ij_D_off                            # B · Σ_i η_{i,j} D^off_{u_i}
-                / (np.log(2) * Psi_j2_n_safe)                       # / (ln2 · Ψ^(n)_{j,2})
-                * sum_eta_tr_H_dB                               # · Σ_i η Tr(H (B_i - B^(n)_i))
-            )
+        if sum_eta_ij_D_off > 0 and not isinstance(sum_eta_tr_H_B, float):
+            term_7 = c45_coef_b[j] * sum_eta_tr_H_B + c45_const_b[j]
         else:
             term_7 = 0.0
 
@@ -1006,94 +1020,6 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         ]
 
     return constraints
-
-
-def parse_group_list(group_text):
-    """
-    解析约束组列表字符串，返回约束组名称列表。
-    约束组名称列表中的每个元素为一个字符串，代表一个约束组。
-    约束组名称列表中的元素顺序与约束组在问题 P6 中的顺序一致。
-    """
-    if group_text is None:
-        return None
-    group_text = str(group_text).strip()
-    if group_text == "":
-        return None
-    # 以","进行输入故以逗号进行分割
-    return [item.strip() for item in group_text.split(",") if item.strip()]
-
-
-def build_constraint_map(args, constraints):
-    I = args.uavs_num
-    J = args.cus_num
-    idx = 0
-    constraint_map = {}
-    constraint_map["4.5"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.12"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.23"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.25"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.27"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.28"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.29"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.32"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.39"] = constraints[idx:idx + J]
-    idx += J
-    constraint_map["4.40"] = constraints[idx:idx + 1]
-    idx += 1
-    constraint_map["4.44"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["4.45"] = constraints[idx:idx + J]
-    idx += J
-    constraint_map["auxiliary_t"] = constraints[idx:idx + I]
-    idx += I
-    constraint_map["var"] = constraints[idx:idx + I * 3 + J]
-    return constraint_map
-
-
-def select_constraints(constraint_map, include_groups=None, exclude_groups=None):
-    all_groups = list(constraint_map.keys())
-    unknown_include = [] if include_groups is None else [g for g in include_groups if g not in constraint_map]
-    unknown_exclude = [] if exclude_groups is None else [g for g in exclude_groups if g not in constraint_map]
-    if len(unknown_include) > 0 or len(unknown_exclude) > 0:
-        raise ValueError(f"未知约束组 include={unknown_include}, exclude={unknown_exclude}, 可选组={all_groups}")
-
-    active_groups = all_groups if include_groups is None else [g for g in all_groups if g in include_groups]
-    if exclude_groups is not None:
-        active_groups = [g for g in active_groups if g not in exclude_groups]
-
-    selected_constraints = []
-    for group in active_groups:
-        selected_constraints.extend(constraint_map[group])
-    return selected_constraints, active_groups
-
-
-def probe_group_feasibility(constraint_map, active_groups, solver):
-    """
-    问题的可行性检验
-    
-    :param constraint_map: 约束组 map 集合，key 为约束组名称，value 为约束列表
-    :param active_groups: 活动约束组名称列表
-    :param solver: 优化求解器
-    :return: 每个约束组的可行性检验结果列表，每个元素为 (约束组名称, 求解状态)
-    """
-    cumulative_constraints = []
-    probe_rows = []
-    for group in active_groups:
-        cumulative_constraints.extend(constraint_map[group])
-        probe_problem = cp.Problem(cp.Minimize(0), cumulative_constraints)
-        probe_problem.solve(solver=solver, warm_start=False)
-        probe_rows.append((group, probe_problem.status))
-        if probe_problem.status in ("infeasible", "infeasible_inaccurate"):
-            break
-    return probe_rows
 
 
 def penalty_based_cccp(args,
@@ -1144,9 +1070,23 @@ def penalty_based_cccp(args,
     hat_bs_2_uav_freqs_norm = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num))
     hat_uav_sen_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
     hat_uav_off_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
-    # DPP 架构，这里直接预计算 rank-1 投影矩阵
+    # 预计算系数保障 DPP 架构
     rank1_sen_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
     rank1_off_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_sen_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_off_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_z = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_f = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_grad_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums)) for _ in range(args.uavs_num)]
+    c45_term4_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_term5_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
     temp_hat_uav_sen_beams, temp_hat_uav_off_beams = initialize_uav_beams(args = args,
                                                                 matched_uav_sensing_channel = matched_uav_sensing_channel,
                                                                 uavs_2_bs_channels = uavs_2_bs_channels
@@ -1154,11 +1094,20 @@ def penalty_based_cccp(args,
     for i in range(args.uavs_num):
         hat_uav_sen_beams[i].value = temp_hat_uav_sen_beams[i]
         hat_uav_off_beams[i].value = temp_hat_uav_off_beams[i]
-    # 更新 rank-1 投影矩阵
-    update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats)
-
     # 定义罚因子
     cur_penalty_factor = cp.Parameter(nonneg=True, value=args.penalty_factor)
+    # 更新 rank-1 投影矩阵
+    update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                          rank1_sen_proj_mats, rank1_off_proj_mats,
+                                          cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                          rank1_const_terms)
+    update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                         obj5_coef_z, obj5_coef_f, obj5_const_terms)
+    update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                               matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                               uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                               c44_const_terms, c44_grad_mats,
+                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
     
     print("-------------------------------------------------------- ")
     print(f"-------------------- CCCP算法开始迭代 -------------------- ")
@@ -1179,6 +1128,12 @@ def penalty_based_cccp(args,
                             hat_uav_off_beams = hat_uav_off_beams,
                             rank1_sen_proj_mats = rank1_sen_proj_mats,
                             rank1_off_proj_mats = rank1_off_proj_mats,
+                            rank1_sen_scaled_proj_mats = rank1_sen_scaled_proj_mats,
+                            rank1_off_scaled_proj_mats = rank1_off_scaled_proj_mats,
+                            rank1_const_terms = rank1_const_terms,
+                            obj5_coef_z = obj5_coef_z,
+                            obj5_coef_f = obj5_coef_f,
+                            obj5_const_terms = obj5_const_terms,
                             cus_entertaining_task_size = cus_entertaining_task_size,
                             uavs_off_duration = uavs_off_duration,
                             cus_off_power = cus_off_power,
@@ -1203,17 +1158,17 @@ def penalty_based_cccp(args,
                                         uavs_2_cus_channels=uavs_2_cus_channels,
                                         uavs_2_bs_channels=uavs_2_bs_channels,
                                         cus_2_bs_channels=cus_2_bs_channels,
-                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix)
-
-    constraint_map = build_constraint_map(args, all_constraints)
-    include_groups = parse_group_list(args.constraint_include_groups)
-    exclude_groups = parse_group_list(args.constraint_exclude_groups)
-    constraints, active_groups = select_constraints(constraint_map,
-                                                    include_groups=include_groups,
-                                                    exclude_groups=exclude_groups)
-    # print(f"启用约束组: {active_groups}")
+                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+                                        c44_const_terms=c44_const_terms,
+                                        c44_grad_mats=c44_grad_mats,
+                                        c45_term4_const=c45_term4_const,
+                                        c45_term5_const=c45_term5_const,
+                                        c45_coef_w=c45_coef_w,
+                                        c45_coef_b=c45_coef_b,
+                                        c45_const_w=c45_const_w,
+                                        c45_const_b=c45_const_b)
     # NOTE - 定义为 DPP，加速求解
-    problem = cp.Problem(cp.Minimize(obj_fun), constraints)
+    problem = cp.Problem(cp.Minimize(obj_fun), all_constraints)
     # print(f"是否定义为 DPP : {problem.is_dcp(dpp=True)}")  # 检测是否为 DPP
     pre_original_obj_fun_val = float('inf')
     for outer_iter in range(args.max_iterations):
@@ -1222,7 +1177,10 @@ def penalty_based_cccp(args,
         cur_original_obj_fun_val = float('inf')
         cur_pure_energy_val = float('inf')
         for inner_iter in range(args.max_iterations):
+            start_time = time.time()
             problem.solve(solver=cp.MOSEK, warm_start=True)
+            end_time = time.time()
+            print(f"第 {inner_iter + 1} 轮迭代耗时: {end_time - start_time:.4f} 秒")
             iter_count += 1
             print(f"总第 {iter_count} 轮（外层 {outer_iter + 1} / 内层 {inner_iter + 1}）迭代状态:", problem.status)
             if problem.status in ("infeasible", "infeasible_inaccurate"):
@@ -1264,9 +1222,19 @@ def penalty_based_cccp(args,
             for i in range(args.uavs_num):
                 hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
                 hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
-            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats)
+            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                  rank1_sen_proj_mats, rank1_off_proj_mats,
+                                                  cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                                  rank1_const_terms)
             hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
             hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+            update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                                 obj5_coef_z, obj5_coef_f, obj5_const_terms)
+            update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                       matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                                       uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                                       c44_const_terms, c44_grad_mats,
+                                                       c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
 
             rank1_gap_max = 0.0
             for i in range(args.uavs_num):
@@ -1286,6 +1254,10 @@ def penalty_based_cccp(args,
             break
         pre_original_obj_fun_val = cur_original_obj_fun_val
         cur_penalty_factor.value *= args.zoom_factor
+        update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                              rank1_sen_proj_mats, rank1_off_proj_mats,
+                                              cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                              rank1_const_terms)
 
     return obj_fun_opt, iter_count
 
@@ -1341,6 +1313,20 @@ def gaussian_randomized_based_cccp(args,
     # DPP 架构，这里直接预计算 rank-1 投影矩阵
     rank1_sen_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
     rank1_off_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_sen_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_off_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_z = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_f = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_grad_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums)) for _ in range(args.uavs_num)]
+    c45_term4_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_term5_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
     temp_hat_uav_sen_beams, temp_hat_uav_off_beams = initialize_uav_beams(args = args,
                                                                 matched_uav_sensing_channel = matched_uav_sensing_channel,
                                                                 uavs_2_bs_channels = uavs_2_bs_channels
@@ -1348,11 +1334,20 @@ def gaussian_randomized_based_cccp(args,
     for i in range(args.uavs_num):
         hat_uav_sen_beams[i].value = temp_hat_uav_sen_beams[i]
         hat_uav_off_beams[i].value = temp_hat_uav_off_beams[i]
-    # 更新 rank-1 投影矩阵
-    update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats)
-
     # 定义罚因子
     cur_penalty_factor = cp.Parameter(nonneg=True, value=args.penalty_factor)
+    # 更新 rank-1 投影矩阵
+    update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                          rank1_sen_proj_mats, rank1_off_proj_mats,
+                                          cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                          rank1_const_terms)
+    update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                         obj5_coef_z, obj5_coef_f, obj5_const_terms)
+    update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                               matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                               uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                               c44_const_terms, c44_grad_mats,
+                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
     
     print("-------------------------------------------------------- ")
     print(f"-------------------- CCCP算法开始迭代 -------------------- ")
@@ -1375,6 +1370,12 @@ def gaussian_randomized_based_cccp(args,
                             hat_uav_off_beams = hat_uav_off_beams,
                             rank1_sen_proj_mats = rank1_sen_proj_mats,
                             rank1_off_proj_mats = rank1_off_proj_mats,
+                            rank1_sen_scaled_proj_mats = rank1_sen_scaled_proj_mats,
+                            rank1_off_scaled_proj_mats = rank1_off_scaled_proj_mats,
+                            rank1_const_terms = rank1_const_terms,
+                            obj5_coef_z = obj5_coef_z,
+                            obj5_coef_f = obj5_coef_f,
+                            obj5_const_terms = obj5_const_terms,
                             cus_entertaining_task_size = cus_entertaining_task_size,
                             uavs_off_duration = uavs_off_duration,
                             cus_off_power = cus_off_power,
@@ -1399,7 +1400,15 @@ def gaussian_randomized_based_cccp(args,
                                         uavs_2_cus_channels=uavs_2_cus_channels,
                                         uavs_2_bs_channels=uavs_2_bs_channels,
                                         cus_2_bs_channels=cus_2_bs_channels,
-                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix)
+                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+                                        c44_const_terms=c44_const_terms,
+                                        c44_grad_mats=c44_grad_mats,
+                                        c45_term4_const=c45_term4_const,
+                                        c45_term5_const=c45_term5_const,
+                                        c45_coef_w=c45_coef_w,
+                                        c45_coef_b=c45_coef_b,
+                                        c45_const_w=c45_const_w,
+                                        c45_const_b=c45_const_b)
 
     constraint_map = build_constraint_map(args, all_constraints)
     include_groups = parse_group_list(args.constraint_include_groups)
@@ -1493,9 +1502,19 @@ def gaussian_randomized_based_cccp(args,
                     hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
                     hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
                 # 更新 rank-1 投影矩阵
-                update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats)
+                update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                      rank1_sen_proj_mats, rank1_off_proj_mats,
+                                                      cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                                      rank1_const_terms)
                 hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
                 hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+                update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                                     obj5_coef_z, obj5_coef_f, obj5_const_terms)
+                update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                           matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                                           uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                                           c44_const_terms, c44_grad_mats,
+                                                           c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
                  # 更新当前目标函数值
                 pre_obj_fun_val = cur_original_obj_fun_val
                 break
@@ -1505,9 +1524,19 @@ def gaussian_randomized_based_cccp(args,
                 hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
                 hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
             # 更新 rank-1 投影矩阵
-            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams, rank1_sen_proj_mats, rank1_off_proj_mats)
+            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                  rank1_sen_proj_mats, rank1_off_proj_mats,
+                                                  cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                                  rank1_const_terms)
             hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
             hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+            update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                                 obj5_coef_z, obj5_coef_f, obj5_const_terms)
+            update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                       matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                                       uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                                       c44_const_terms, c44_grad_mats,
+                                                       c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
             # 更新当前目标函数值（原始目标函数值）
             pre_obj_fun_val = cur_original_obj_fun_val
 
@@ -1519,6 +1548,10 @@ def gaussian_randomized_based_cccp(args,
 
         # 更新罚因子
         cur_penalty_factor.value *= args.zoom_factor  
+        update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                              rank1_sen_proj_mats, rank1_off_proj_mats,
+                                              cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                              rank1_const_terms)
         
         # 如果满足了 rank1 的门限，则提前退出
         if rank1_gap_max < args.rank1_threshold:
