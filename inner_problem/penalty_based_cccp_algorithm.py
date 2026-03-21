@@ -73,7 +73,7 @@ def get_base_args():
     base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
-    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45，auxiliary_t,var", help="启用约束组，逗号分隔")
+    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
     return base_parser.parse_args()
@@ -1271,17 +1271,32 @@ def penalty_based_cccp(args,
     rank1_gap_max = float('inf')
     energy_val_list = []
     rank1_val_list = []
-    cur_opt_energy_val = float('inf')
+    cur_original_obj_fun_val = float('inf')
     for outer_iter in range(args.max_iterations):
-        pre_penalized_obj_val = float('inf')
+        pre_original_obj_fun_val = float('inf')
         for inner_iter in range(args.max_iterations):
             print(f"-------------------- 第 {iter_count + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
-            problem.solve(solver=cp.MOSEK, warm_start=True)
+            problem.solve(solver=cp.MOSEK, warm_start=True, verbose=False)
             iter_count += 1
             if problem.status in ("infeasible", "infeasible_inaccurate"):
                 print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
                 return float('inf'), iter_count
             elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
+                cur_original_obj_fun_val = compute_original_obj_fun_value(
+                    args=args,
+                    cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
+                    cur_uavs_off_beams=[v.value for v in var_uavs_off_beam],
+                    cur_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
+                    cur_auxiliary_variable_z=var_auxiliary_variable_z.value,
+                    cur_cus_off_duration=var_cus_off_duration.value,
+                    cus_entertaining_task_size=cus_entertaining_task_size,
+                    uavs_off_duration=uavs_off_duration,
+                    cus_off_power=cus_off_power,
+                    uavs_pos_pre=uavs_pos_pre,
+                    uavs_pos_cur=uavs_pos_cur,
+                    cur_penalty_factor=cur_penalty_factor.value,
+                    use_penalty_rank1=use_penalty_rank1
+                )
                 cur_pure_energy_val = compute_pure_energy_value(
                     args=args,
                     cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
@@ -1295,8 +1310,8 @@ def penalty_based_cccp(args,
                     uavs_pos_pre=uavs_pos_pre,
                     uavs_pos_cur=uavs_pos_cur
                 )
-                cur_opt_energy_val = problem.value
-                print(f"第 {iter_count} 轮求解的问题的 VALUE 值:", cur_opt_energy_val, f"当前状态 : {problem.status}")
+                print(f"第 {iter_count} 轮当前状态 : {problem.status}")
+                print(f"第 {iter_count} 轮原始问题的最优值:", cur_original_obj_fun_val)
                 print(f"第 {iter_count} 轮不考虑罚函数下的纯能耗值:", cur_pure_energy_val)
             for i in range(args.uavs_num):
                 hat_uav_sen_beams[i].value = var_uavs_sen_beam[i].value
@@ -1309,15 +1324,15 @@ def penalty_based_cccp(args,
                 b_gap = np.real(np.trace(var_uavs_off_beam[i].value)) - np.linalg.norm(var_uavs_off_beam[i].value, 2)
                 rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
             print(f"第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
-            energy_val_list.append(cur_opt_energy_val)
+            energy_val_list.append(cur_pure_energy_val)
             rank1_val_list.append(rank1_gap_max)
 
-            obj_fun_opt = cur_opt_energy_val
-            if inner_iter != 0 and abs(cur_opt_energy_val - pre_penalized_obj_val) < args.cccp_threshold:
-                print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_opt_energy_val)
+            obj_fun_opt = cur_original_obj_fun_val
+            if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
+                print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_original_obj_fun_val)
                 print(f" Convergency!!! - 第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
                 break
-            pre_penalized_obj_val = cur_opt_energy_val
+            pre_original_obj_fun_val = cur_original_obj_fun_val
             update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
                                                     rank1_sen_proj_mats, rank1_off_proj_mats,
                                                     cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
