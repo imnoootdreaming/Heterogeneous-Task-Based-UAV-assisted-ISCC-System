@@ -44,6 +44,7 @@ def get_base_args():
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
     base_parser.add_argument("--bs_max_freq", type=float, default=10e9, help="BS 最大工作频率 (Hz)")
     base_parser.add_argument("--freq_scale", type=float, default=1e9, help="频率归一化尺度")
+    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  # 20260321 - 修改了 obj5
     base_parser.add_argument("--bs_cycles_per_bit", type=float, default=1000, help="BS 处理 1bit 需要的周期数")
     base_parser.add_argument("--time_slot_duration", type=float, default=0.6, help="时隙长度 (s)")
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
@@ -73,9 +74,13 @@ def get_base_args():
     base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
+    base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
+    base_parser.add_argument("--diagnostic_violation_tol", type=float, default=1e-7, help="CCCP 诊断时的违约容差")
+    base_parser.add_argument("--diagnostic_top_k", type=int, default=5, help="CCCP 诊断时打印的最大违约约束组数量")
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-2, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
     return base_parser.parse_args()
 
 
@@ -436,13 +441,14 @@ def update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_b
 def update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
                                          obj5_coef_z, obj5_coef_f, obj5_const_terms):
     alpha = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration
-    scale_4 = args.freq_scale ** 4
+    scale_2 = args.freq_scale ** 2  # 20260321 - 修改了 obj5
+    beta = alpha * args.z_scale * scale_2  # 20260321 - 修改了 obj5
     for i in range(args.uavs_num):
         hat_z = float(hat_auxiliary_variable_z.value[i])
         hat_f = float(hat_bs_2_uav_freqs_norm.value[i])
-        obj5_coef_z.value[i] = -alpha * hat_z
-        obj5_coef_f.value[i] = -alpha * 2.0 * (hat_f ** 3) * scale_4
-        obj5_const_terms.value[i] = alpha * (0.5 * (hat_z ** 2) + 1.5 * (hat_f ** 4) * scale_4)
+        obj5_coef_z.value[i] = -beta * hat_z  # 20260321 - 修改了 obj5
+        obj5_coef_f.value[i] = -2.0 * beta * (hat_f ** 3)  # 20260321 - 修改了 obj5
+        obj5_const_terms.value[i] = beta * (0.5 * (hat_z ** 2) + 1.5 * (hat_f ** 4))  # 20260321 - 修改了 obj5
 
 
 def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
@@ -455,6 +461,7 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
     N = args.antenna_nums
     B = args.bandwidth
     sigma_2 = dbm_2_watt(args.noise_power_density_dbm) * B
+    psi_floor = float(args.linearization_psi_floor)
     D_sen = args.uav_sen_duration
     xi1 = args.radar_duty_ratio / (2.0 * args.radar_impulse_duration)
     xi2 = (2.0 * args.var_range_fluctuation
@@ -482,9 +489,12 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
         Delta_i = Delta_list[i]
         hat_W_i = hat_uav_sen_beams[i].value
         Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T)
-        _, logdet_Delta_i = np.linalg.slogdet(Delta_i)
-        _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n)
-        AH_Psiinv_A = A_i.conj().T @ np.linalg.inv(Psi_i_n) @ A_i
+        Delta_i_reg = Delta_i + psi_floor * np.eye(N, dtype=complex)
+        Psi_i_n_reg = Psi_i_n + psi_floor * np.eye(N, dtype=complex)
+        _, logdet_Delta_i = np.linalg.slogdet(Delta_i_reg)
+        _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n_reg)
+        Psiinv_A = np.linalg.solve(Psi_i_n_reg, A_i)
+        AH_Psiinv_A = A_i.conj().T @ Psiinv_A
         grad_mat = (xi1 * xi2 / np.log(2)) * AH_Psiinv_A
         c44_grad_mats[i].value = (grad_mat + grad_mat.conj().T) / 2
         tr_grad_W = np.real(np.trace(c44_grad_mats[i].value @ hat_W_i))
@@ -500,8 +510,8 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
             if eta_ij > 0:
                 Psi_j1_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
                 Psi_j2_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
-        Psi_j1_n_safe = float(np.real(Psi_j1_n))
-        Psi_j2_n_safe = float(np.real(Psi_j2_n))
+        Psi_j1_n_safe = max(float(np.real(Psi_j1_n)), psi_floor)
+        Psi_j2_n_safe = max(float(np.real(Psi_j2_n)), psi_floor)
         c45_term4_const.value[j] = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n_safe)
         c45_term5_const.value[j] = sum_eta_ij_D_off * B * np.log2(Psi_j2_n_safe)
 
@@ -555,8 +565,8 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
         obj_fun += omega_weight_1 * kappa * (
             args.bs_cycles_per_bit *
             args.uav_sen_duration *
-            (cp.square(var_t[i]) * (args.freq_scale ** 4))
-        ) / 2
+            (cp.square(var_t[i]) * (args.freq_scale ** 2) * args.z_scale)  # 20260321 - 修改了 obj5
+        ) / 2  # 20260321 - 修改了 obj5
 
     # ==============================
     # 第二项
@@ -638,7 +648,7 @@ def compute_original_obj_fun_value(args, cur_uavs_sen_beams, cur_uavs_off_beams,
                       (args.uav_c2 * (args.time_slot_duration ** 2) / uav_dist_diff))
     for i in range(args.uavs_num):
         f_ui = cur_bs_2_uav_freqs_norm[i] * args.freq_scale
-        obj_fun += omega_weight_1 * kappa * args.bs_cycles_per_bit * args.uav_sen_duration * cur_auxiliary_variable_z[i] * (f_ui ** 2)
+        obj_fun += omega_weight_1 * kappa * args.bs_cycles_per_bit * args.uav_sen_duration * (args.z_scale * cur_auxiliary_variable_z[i]) * (f_ui ** 2)  # 20260321 - 修改了 obj5
     for j in range(args.cus_num):
         denom = max(cu_max_delay - cur_cus_off_duration[j], 1e-8)
         obj_fun += omega_weight_1 * kappa * ((args.bs_cycles_per_bit * cus_entertaining_task_size[j]) ** 3) / (denom ** 2)
@@ -680,6 +690,57 @@ def compute_pure_energy_value(args, cur_uavs_sen_beams, cur_uavs_off_beams, cur_
         cur_penalty_factor=0.0,
         use_penalty_rank1=False,
     )
+
+
+def compute_original_obj5_value(args, cur_bs_2_uav_freqs_norm, cur_auxiliary_variable_z):
+    alpha = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration
+    z_val = np.asarray(cur_auxiliary_variable_z, dtype=float) * args.z_scale  # 20260321 - 修改了 obj5
+    f_val = np.asarray(cur_bs_2_uav_freqs_norm, dtype=float) * args.freq_scale
+    return float(alpha * np.sum(z_val * np.square(f_val)))
+
+
+def compute_surrogate_obj5_value(args, cur_bs_2_uav_freqs_norm, cur_auxiliary_variable_z, cur_t,
+                                 obj5_coef_z, obj5_coef_f, obj5_const_terms):
+    alpha = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration
+    scale_2 = args.freq_scale ** 2  # 20260321 - 修改了 obj5
+    beta = alpha * args.z_scale * scale_2  # 20260321 - 修改了 obj5
+    z_val = np.asarray(cur_auxiliary_variable_z, dtype=float)
+    f_val = np.asarray(cur_bs_2_uav_freqs_norm, dtype=float)
+    t_val = np.asarray(cur_t, dtype=float)
+    coef_z = np.asarray(obj5_coef_z.value, dtype=float)
+    coef_f = np.asarray(obj5_coef_f.value, dtype=float)
+    const_terms = np.asarray(obj5_const_terms.value, dtype=float)
+    surrogate_val = np.sum(
+        0.5 * beta * np.square(t_val)  # 20260321 - 修改了 obj5
+        + coef_z * z_val
+        + coef_f * f_val
+        + const_terms
+    )
+    return float(np.real(surrogate_val))
+
+
+def compute_original_rank1_penalty_value(cur_uavs_sen_beams, cur_uavs_off_beams, cur_penalty_factor):
+    rho = float(cur_penalty_factor)
+    penalty_val = 0.0
+    for sen_beam, off_beam in zip(cur_uavs_sen_beams, cur_uavs_off_beams):
+        w_gap = np.real(np.trace(sen_beam)) - np.linalg.norm(sen_beam, 2)
+        b_gap = np.real(np.trace(off_beam)) - np.linalg.norm(off_beam, 2)
+        penalty_val += rho * (max(float(w_gap), 0.0) + max(float(b_gap), 0.0))
+    return float(penalty_val)
+
+
+def compute_surrogate_rank1_penalty_value(cur_uavs_sen_beams, cur_uavs_off_beams, cur_penalty_factor,
+                                          rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats, rank1_const_terms):
+    rho = float(cur_penalty_factor)
+    penalty_val = 0.0
+    for i, (sen_beam, off_beam) in enumerate(zip(cur_uavs_sen_beams, cur_uavs_off_beams)):
+        penalty_val += (
+            rho * (np.real(np.trace(sen_beam)) + np.real(np.trace(off_beam)))
+            - np.real(np.trace(rank1_sen_scaled_proj_mats[i].value @ sen_beam))
+            - np.real(np.trace(rank1_off_scaled_proj_mats[i].value @ off_beam))
+            + float(rank1_const_terms.value[i])
+        )
+    return float(np.real(penalty_val))
 
 
 def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs_norm, var_auxiliary_variable_z, var_cus_off_duration, var_t,
@@ -768,7 +829,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             D_sen * var_bs_2_uav_freqs_norm[i] * args.freq_scale                      # D̄_sen · f_{u_i}
             + uavs_off_duration[i] * var_bs_2_uav_freqs_norm[i] * args.freq_scale    # + D^off_{u_i} · f_{u_i}
             - D_max_ui * var_bs_2_uav_freqs_norm[i] * args.freq_scale                 # - D^max_{u_i} · f_{u_i}
-            + C_bit * D_sen * var_auxiliary_variable_z[i]                              # + C_{u_i} · D̄_sen · z_i
+            + C_bit * D_sen * args.z_scale * var_auxiliary_variable_z[i]              # + C_{u_i} · D̄_sen · z_i  # 20260321 - 修改了 obj5
             <= 0
         )
 
@@ -834,7 +895,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         interf_plus_noise = float(np.sum(uavs_cus_matched_matrix[i, :] * cus_off_power * h_cj_BS_sq)) + sigma_2
 
         constraints.append(
-            D_sen * var_auxiliary_variable_z[i]                
+            D_sen * args.z_scale * var_auxiliary_variable_z[i]  # 20260321 - 修改了 obj5
             - uavs_off_duration[i] * B * cp.log(cp.real(cp.trace(H_i @ var_uavs_off_beam[i]))+ interf_plus_noise) / np.log(2)
             + uavs_off_duration[i] * B * np.log2(interf_plus_noise)                     
             <= 0
@@ -878,7 +939,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     for i in range(I):
         lhs_44 = (
             c44_const_terms[i]
-            - var_auxiliary_variable_z[i]
+            - args.z_scale * var_auxiliary_variable_z[i]  # 20260321 - 修改了 obj5
             + cp.real(cp.trace(c44_grad_mats[i] @ var_uavs_sen_beam[i]))
         )
         constraints.append(lhs_44 <= 0)
@@ -1002,13 +1063,13 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             <= 0
         )
 
-    # 追加为了满足 DCP 而引入的变量 t = x + y^{2}
+    # 追加为了满足 DCP 而引入的变量 t = z_norm + f_norm^{2}  # 20260321 - 修改了 obj5
     # var_t 为 epigraph 上镜图
     # 2026-03-17 修改： var_t 成为归一化变量
     for i in range(args.uavs_num):
         constraints.append(
-            (var_auxiliary_variable_z[i] / (args.freq_scale ** 2)) + cp.square(var_bs_2_uav_freqs_norm[i]) - var_t[i] <= 0
-        )
+            var_auxiliary_variable_z[i] + cp.square(var_bs_2_uav_freqs_norm[i]) - var_t[i] <= 0  # 20260321 - 修改了 obj5
+        )  # 20260321 - 修改了 obj5
     
     # 定义变量大于 0 
     for i in range(I):
@@ -1093,6 +1154,136 @@ def select_constraints(constraint_map, include_groups=None, exclude_groups=None)
     return selected_constraints, active_groups
 
 
+def _safe_constraint_violation_value(constraint):
+    try:
+        violation = constraint.violation()
+    except Exception:
+        return float("inf")
+
+    if violation is None:
+        return float("inf")
+
+    violation_arr = np.real(np.asarray(violation, dtype=float))
+    if violation_arr.size == 0:
+        return 0.0
+    if not np.all(np.isfinite(violation_arr)):
+        return float("inf")
+    return float(np.max(violation_arr))
+
+
+def summarize_constraint_violations(constraint_map, group_names):
+    violation_reports = []
+    for group_name in group_names:
+        group_constraints = constraint_map.get(group_name, [])
+        worst_violation = 0.0
+        worst_local_idx = 0
+        for local_idx, constraint in enumerate(group_constraints, start=1):
+            cur_violation = _safe_constraint_violation_value(constraint)
+            if cur_violation > worst_violation:
+                worst_violation = cur_violation
+                worst_local_idx = local_idx
+        violation_reports.append({
+            "group": group_name,
+            "max_violation": worst_violation,
+            "worst_local_idx": worst_local_idx,
+            "constraint_count": len(group_constraints),
+        })
+
+    violation_reports.sort(key=lambda item: item["max_violation"], reverse=True)
+    return violation_reports
+
+
+def run_cccp_locator(args, iter_count, cur_surrogate_opt_val, cur_original_obj_fun_val, problem,
+                     constraint_map, active_groups, var_uavs_sen_beam, var_uavs_off_beam,
+                     var_auxiliary_variable_z, var_bs_2_uav_freqs_norm, var_t,
+                     cur_penalty_factor, use_penalty_rank1,
+                     obj5_coef_z, obj5_coef_f, obj5_const_terms,
+                     rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats, rank1_const_terms):
+    tol = args.diagnostic_violation_tol
+    top_k = max(1, int(args.diagnostic_top_k))
+
+    next_surrogate_at_cur_point = float(np.real(problem.objective.value))
+    touching_gap = next_surrogate_at_cur_point - float(cur_original_obj_fun_val)
+    transition_gap = next_surrogate_at_cur_point - float(cur_surrogate_opt_val)
+
+    cur_uavs_sen_beams = [beam.value for beam in var_uavs_sen_beam]
+    cur_uavs_off_beams = [beam.value for beam in var_uavs_off_beam]
+    z_val = np.asarray(var_auxiliary_variable_z.value, dtype=float)
+    f_val = np.asarray(var_bs_2_uav_freqs_norm.value, dtype=float)
+    t_val = np.asarray(var_t.value, dtype=float)
+    t_slack = t_val - z_val - np.square(f_val)  # 20260321 - 修改了 obj5
+    max_t_slack = float(np.max(t_slack))
+    worst_t_idx = int(np.argmax(t_slack)) + 1
+
+    original_obj5_val = compute_original_obj5_value(
+        args=args,
+        cur_bs_2_uav_freqs_norm=f_val,
+        cur_auxiliary_variable_z=z_val,
+    )
+    surrogate_obj5_val = compute_surrogate_obj5_value(
+        args=args,
+        cur_bs_2_uav_freqs_norm=f_val,
+        cur_auxiliary_variable_z=z_val,
+        cur_t=t_val,
+        obj5_coef_z=obj5_coef_z,
+        obj5_coef_f=obj5_coef_f,
+        obj5_const_terms=obj5_const_terms,
+    )
+    obj5_gap = surrogate_obj5_val - original_obj5_val
+
+    if use_penalty_rank1:
+        original_rank1_penalty_val = compute_original_rank1_penalty_value(
+            cur_uavs_sen_beams=cur_uavs_sen_beams,
+            cur_uavs_off_beams=cur_uavs_off_beams,
+            cur_penalty_factor=float(cur_penalty_factor.value),
+        )
+        surrogate_rank1_penalty_val = compute_surrogate_rank1_penalty_value(
+            cur_uavs_sen_beams=cur_uavs_sen_beams,
+            cur_uavs_off_beams=cur_uavs_off_beams,
+            cur_penalty_factor=float(cur_penalty_factor.value),
+            rank1_sen_scaled_proj_mats=rank1_sen_scaled_proj_mats,
+            rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
+            rank1_const_terms=rank1_const_terms,
+        )
+    else:
+        original_rank1_penalty_val = 0.0
+        surrogate_rank1_penalty_val = 0.0
+    rank1_gap = surrogate_rank1_penalty_val - original_rank1_penalty_val
+    residual_touching_gap = touching_gap - obj5_gap - rank1_gap
+
+    linearized_groups = [group for group in ("4.44", "4.45") if group in active_groups]
+    linearized_reports = summarize_constraint_violations(constraint_map, linearized_groups)
+    active_reports = summarize_constraint_violations(constraint_map, active_groups)
+
+    print(f"[CCCP-DIAG] 第 {iter_count} 轮更新线性化后，将当前解代回下一轮子问题:")
+    print(f"[CCCP-DIAG]   当前 surrogate optimum = {float(cur_surrogate_opt_val):.12e}")
+    print(f"[CCCP-DIAG]   下一轮 surrogate@current = {next_surrogate_at_cur_point:.12e}")
+    print(f"[CCCP-DIAG]   touching gap = surrogate@current - original(current) = {touching_gap:.12e}")
+    print(f"[CCCP-DIAG]   transition gap = surrogate@current - current surrogate optimum = {transition_gap:.12e}")
+    print(f"[CCCP-DIAG]   max auxiliary_t slack = {max_t_slack:.12e} (i = {worst_t_idx})")
+    print(f"[CCCP-DIAG]   original obj5 = {original_obj5_val:.12e}")
+    print(f"[CCCP-DIAG]   surrogate obj5 = {surrogate_obj5_val:.12e}")
+    print(f"[CCCP-DIAG]   obj5 gap = surrogate obj5 - original obj5 = {obj5_gap:.12e}")
+    print(f"[CCCP-DIAG]   original rank1 penalty = {original_rank1_penalty_val:.12e}")
+    print(f"[CCCP-DIAG]   surrogate rank1 penalty = {surrogate_rank1_penalty_val:.12e}")
+    print(f"[CCCP-DIAG]   rank1 penalty gap = surrogate rank1 - original rank1 = {rank1_gap:.12e}")
+    print(f"[CCCP-DIAG]   residual touching gap = total - obj5 gap - rank1 gap = {residual_touching_gap:.12e}")
+
+    if linearized_reports:
+        worst_linearized = linearized_reports[0]
+        print(f"[CCCP-DIAG]   最坏线性化约束组 = {worst_linearized['group']}, max violation = {worst_linearized['max_violation']:.12e}, local idx = {worst_linearized['worst_local_idx']}")
+        for report in linearized_reports[:top_k]:
+            print(f"[CCCP-DIAG]     group {report['group']}: max violation = {report['max_violation']:.12e}, local idx = {report['worst_local_idx']}")
+
+    flagged_reports = [report for report in active_reports if report["max_violation"] > tol]
+    if flagged_reports:
+        print(f"[CCCP-DIAG]   max violation > tol ({tol:.1e}) 的约束组:")
+        for report in flagged_reports[:top_k]:
+            print(f"[CCCP-DIAG]     group {report['group']}: max violation = {report['max_violation']:.12e}, local idx = {report['worst_local_idx']}")
+    else:
+        print(f"[CCCP-DIAG]   所有激活约束在 tol = {tol:.1e} 内仍保持可行")
+
+
 def probe_group_feasibility(constraint_map, active_groups, solver):
     """
     问题的可行性检验
@@ -1153,11 +1344,11 @@ def penalty_based_cccp(args,
     var_uavs_sen_beam = [cp.Variable((args.antenna_nums, args.antenna_nums), hermitian=True) for _ in range(args.uavs_num)]
     var_uavs_off_beam = [cp.Variable((args.antenna_nums, args.antenna_nums), hermitian=True) for _ in range(args.uavs_num)]
     var_bs_2_uav_freqs_norm = cp.Variable(args.uavs_num, nonneg=True)
-    var_auxiliary_variable_z = cp.Variable(args.uavs_num, nonneg=True)
+    var_auxiliary_variable_z = cp.Variable(args.uavs_num, nonneg=True)  # 20260321 - 修改了 obj5
     var_cus_off_duration = cp.Variable(args.cus_num, nonneg=True)
     var_t = cp.Variable(args.uavs_num, nonneg=True)  # 辅助变量 t 是为了保障满足 DCP, 该变量没有在文中使用
     # 声明初始值
-    hat_auxiliary_variable_z = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * 1e5)
+    hat_auxiliary_variable_z = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (1e5 / args.z_scale))  # 20260321 - 修改了 obj5
     hat_bs_2_uav_freqs_norm = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num / 2))
     hat_uav_sen_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
     hat_uav_off_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
@@ -1277,7 +1468,11 @@ def penalty_based_cccp(args,
         for inner_iter in range(args.max_iterations):
             print(f"-------------------- 第 {iter_count + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
             problem.solve(solver=cp.MOSEK, warm_start=True, verbose=False)
+            print("compilation_time =", problem.compilation_time)
+            print("solve_time =", problem.solver_stats.solve_time)
+            print("num_iters =", problem.solver_stats.num_iters)
             iter_count += 1
+            cur_surrogate_opt_val = float(np.real(problem.objective.value))
             if problem.status in ("infeasible", "infeasible_inaccurate"):
                 print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
                 return float('inf'), iter_count
@@ -1344,6 +1539,29 @@ def penalty_based_cccp(args,
                                                         uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
                                                         c44_const_terms, c44_grad_mats,
                                                         c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
+            if args.enable_cccp_diagnostics == True:
+                run_cccp_locator(
+                    args=args,
+                    iter_count=iter_count,
+                    cur_surrogate_opt_val=cur_surrogate_opt_val,
+                    cur_original_obj_fun_val=cur_original_obj_fun_val,
+                    problem=problem,
+                    constraint_map=constraint_map,
+                    active_groups=active_groups,
+                    var_uavs_sen_beam=var_uavs_sen_beam,
+                    var_uavs_off_beam=var_uavs_off_beam,
+                    var_auxiliary_variable_z=var_auxiliary_variable_z,
+                    var_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm,
+                    var_t=var_t,
+                    cur_penalty_factor=cur_penalty_factor,
+                    use_penalty_rank1=use_penalty_rank1,
+                    obj5_coef_z=obj5_coef_z,
+                    obj5_coef_f=obj5_coef_f,
+                    obj5_const_terms=obj5_const_terms,
+                    rank1_sen_scaled_proj_mats=rank1_sen_scaled_proj_mats,
+                    rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
+                    rank1_const_terms=rank1_const_terms,
+                )
         if rank1_gap_max < args.rank1_threshold:
             break
         cur_penalty_factor.value *= args.zoom_factor
