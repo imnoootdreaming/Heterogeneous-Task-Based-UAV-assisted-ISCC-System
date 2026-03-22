@@ -69,18 +69,22 @@ def get_base_args():
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
 
     # 基于惩罚的 CCCP 算法参数
-    base_parser.add_argument("--max_iterations", type=int, default=10, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--max_iterations", type=int, default=5, help="CCCP 算法最大迭代次数")
     base_parser.add_argument("--cccp_threshold", type=float, default=1e-6, help="CCCP 算法目标函数收敛阈值")
     base_parser.add_argument("--rank1_threshold", type=float, default=1e-6, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
-    base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
+    base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
     base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
     base_parser.add_argument("--diagnostic_violation_tol", type=float, default=1e-7, help="CCCP 诊断时的违约容差")
     base_parser.add_argument("--diagnostic_top_k", type=int, default=5, help="CCCP 诊断时打印的最大违约约束组数量")
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
-    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-2, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-8, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=True,
+                             help="开关参数")
+    base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
+                             help="强度参数")
     return base_parser.parse_args()
 
 
@@ -433,12 +437,9 @@ def update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_
         obj5_coef_f.value[i] = -2.0 * beta * (hat_f ** 3)  # 20260321 - 修改了 obj5
         obj5_const_terms.value[i] = beta * (0.5 * (hat_z ** 2) + 1.5 * (hat_f ** 4))  # 20260321 - 修改了 obj5
 
-
-def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
-                                               matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
-                                               uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
-                                               c44_const_terms, c44_grad_mats,
-                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b):
+def build_static_constraint_data(args, matched_uav_sensing_channel,
+                                 uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
+                                 uavs_cus_matched_matrix, uavs_off_duration, cus_off_power):
     I = args.uavs_num
     J = args.cus_num
     N = args.antenna_nums
@@ -451,66 +452,127 @@ def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_
            * (args.radar_spectrum_shape ** 2)
            * (args.bandwidth ** 3)
            * args.radar_impulse_duration)
+    eye_n = np.eye(N, dtype=complex)
+    eta_matrix = np.asarray(uavs_cus_matched_matrix, dtype=float)
+    uavs_off_duration = np.asarray(uavs_off_duration, dtype=float)
+    cus_off_power = np.asarray(cus_off_power, dtype=float)
+    h_cj_BS_sq = np.asarray([abs(cus_2_bs_channels[j, 0]) ** 2 for j in range(J)], dtype=float)
 
     Delta_list = []
+    AH_Dinv_A_list = []
+    logdet_Delta_reg_over_ln2 = np.zeros(I, dtype=float)
     for i in range(I):
-        Delta_i = sigma_2 * np.eye(N, dtype=complex)
+        Delta_i = sigma_2 * eye_n.copy()
         for j in range(J):
-            eta_ij = uavs_cus_matched_matrix[i, j]
+            eta_ij = eta_matrix[i, j]
             if eta_ij > 0:
                 h_ij = uavs_2_cus_channels[i, j, :]
                 Delta_i = Delta_i + eta_ij * cus_off_power[j] * np.outer(h_ij, np.conj(h_ij))
         Delta_list.append(Delta_i)
+
+        A_i = matched_uav_sensing_channel[i]
+        AH_Dinv_A = A_i.conj().T @ np.linalg.solve(Delta_i, A_i)
+        AH_Dinv_A_list.append((AH_Dinv_A + AH_Dinv_A.conj().T) / 2)
+
+        Delta_i_reg = Delta_i + psi_floor * eye_n
+        _, logdet_Delta_i_reg = np.linalg.slogdet(Delta_i_reg)
+        logdet_Delta_reg_over_ln2[i] = float(logdet_Delta_i_reg / np.log(2))
 
     H_ui_BS_list = []
     for i in range(I):
         h_i = uavs_2_bs_channels[i, 0, :]
         H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))
 
+    interf_plus_noise_vec = eta_matrix @ (cus_off_power * h_cj_BS_sq) + sigma_2
+    sum_eta_ij_D_sen_vec = D_sen * np.sum(eta_matrix, axis=0)
+    sum_eta_ij_D_off_vec = eta_matrix.T @ uavs_off_duration
+    log2_cu_snr_vec = np.log2(1.0 + cus_off_power * h_cj_BS_sq / sigma_2)
+
+    return {
+        "A_list": matched_uav_sensing_channel,
+        "Delta_list": Delta_list,
+        "AH_Dinv_A_list": AH_Dinv_A_list,
+        "H_ui_BS_list": H_ui_BS_list,
+        "h_cj_BS_sq": h_cj_BS_sq,
+        "eta_matrix": eta_matrix,
+        "interf_plus_noise_vec": np.asarray(interf_plus_noise_vec, dtype=float),
+        "sum_eta_ij_D_sen_vec": np.asarray(sum_eta_ij_D_sen_vec, dtype=float),
+        "sum_eta_ij_D_off_vec": np.asarray(sum_eta_ij_D_off_vec, dtype=float),
+        "log2_cu_snr_vec": np.asarray(log2_cu_snr_vec, dtype=float),
+        "logdet_Delta_reg_over_ln2": logdet_Delta_reg_over_ln2,
+        "sigma_2": float(sigma_2),
+        "psi_floor": psi_floor,
+        "xi1": float(xi1),
+        "xi2": float(xi2),
+        "B": float(B),
+        "eye_n": eye_n,
+    }
+
+
+def update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                               static_constraint_data,
+                                               c44_const_terms, c44_grad_mats,
+                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b):
+    I = args.uavs_num
+    J = args.cus_num
+    B = static_constraint_data["B"]
+    sigma_2 = static_constraint_data["sigma_2"]
+    psi_floor = static_constraint_data["psi_floor"]
+    xi1 = static_constraint_data["xi1"]
+    xi2 = static_constraint_data["xi2"]
+    eye_n = static_constraint_data["eye_n"]
+    A_list = static_constraint_data["A_list"]
+    Delta_list = static_constraint_data["Delta_list"]
+    H_ui_BS_list = static_constraint_data["H_ui_BS_list"]
+    eta_matrix = static_constraint_data["eta_matrix"]
+    sum_eta_ij_D_sen_vec = static_constraint_data["sum_eta_ij_D_sen_vec"]
+    sum_eta_ij_D_off_vec = static_constraint_data["sum_eta_ij_D_off_vec"]
+    logdet_Delta_reg_over_ln2 = static_constraint_data["logdet_Delta_reg_over_ln2"]
+
+    tr_hat_w_bs = np.zeros(I, dtype=float)
+    tr_hat_b_bs = np.zeros(I, dtype=float)
     for i in range(I):
-        A_i = matched_uav_sensing_channel[i]
+        tr_hat_w_bs[i] = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
+        tr_hat_b_bs[i] = float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
+
+    for i in range(I):
+        A_i = A_list[i]
         Delta_i = Delta_list[i]
         hat_W_i = hat_uav_sen_beams[i].value
         Psi_i_n = Delta_i + xi2 * (A_i @ hat_W_i @ A_i.conj().T)
-        Delta_i_reg = Delta_i + psi_floor * np.eye(N, dtype=complex)
-        Psi_i_n_reg = Psi_i_n + psi_floor * np.eye(N, dtype=complex)
-        _, logdet_Delta_i = np.linalg.slogdet(Delta_i_reg)
+        Psi_i_n_reg = Psi_i_n + psi_floor * eye_n
         _, logdet_Psi_i_n = np.linalg.slogdet(Psi_i_n_reg)
         Psiinv_A = np.linalg.solve(Psi_i_n_reg, A_i)
         AH_Psiinv_A = A_i.conj().T @ Psiinv_A
         grad_mat = (xi1 * xi2 / np.log(2)) * AH_Psiinv_A
         c44_grad_mats[i].value = (grad_mat + grad_mat.conj().T) / 2
         tr_grad_W = np.real(np.trace(c44_grad_mats[i].value @ hat_W_i))
-        c44_const_terms.value[i] = float(-xi1 * (logdet_Delta_i / np.log(2)) + xi1 * (logdet_Psi_i_n / np.log(2))) - float(tr_grad_W)
+        c44_const_terms.value[i] = float(
+            -xi1 * logdet_Delta_reg_over_ln2[i]
+            + xi1 * (logdet_Psi_i_n / np.log(2))
+            - tr_grad_W
+        )
 
-    for j in range(J):
-        sum_eta_ij_D_sen = D_sen * float(np.sum(uavs_cus_matched_matrix[:, j]))
-        sum_eta_ij_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
-        Psi_j1_n = sigma_2
-        Psi_j2_n = sigma_2
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]
-            if eta_ij > 0:
-                Psi_j1_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
-                Psi_j2_n += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
-        Psi_j1_n_safe = max(float(np.real(Psi_j1_n)), psi_floor)
-        Psi_j2_n_safe = max(float(np.real(Psi_j2_n)), psi_floor)
-        c45_term4_const.value[j] = sum_eta_ij_D_sen * B * np.log2(Psi_j1_n_safe)
-        c45_term5_const.value[j] = sum_eta_ij_D_off * B * np.log2(Psi_j2_n_safe)
+    tr_hat_w_sum_vec = eta_matrix.T @ tr_hat_w_bs
+    tr_hat_b_sum_vec = eta_matrix.T @ tr_hat_b_bs
+    Psi_j1_n_safe_vec = np.maximum(sigma_2 + tr_hat_w_sum_vec, psi_floor)
+    Psi_j2_n_safe_vec = np.maximum(sigma_2 + tr_hat_b_sum_vec, psi_floor)
+    ln2 = np.log(2)
 
-        coef_w_j = B * sum_eta_ij_D_sen / (np.log(2) * Psi_j1_n_safe) if sum_eta_ij_D_sen > 0 else 0.0
-        coef_b_j = B * sum_eta_ij_D_off / (np.log(2) * Psi_j2_n_safe) if sum_eta_ij_D_off > 0 else 0.0
-        tr_hat_w_sum = 0.0
-        tr_hat_b_sum = 0.0
-        for i in range(I):
-            eta_ij = uavs_cus_matched_matrix[i, j]
-            if eta_ij > 0:
-                tr_hat_w_sum += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_sen_beams[i].value)))
-                tr_hat_b_sum += eta_ij * float(np.real(np.trace(H_ui_BS_list[i] @ hat_uav_off_beams[i].value)))
-        c45_coef_w.value[j] = coef_w_j
-        c45_coef_b.value[j] = coef_b_j
-        c45_const_w.value[j] = -coef_w_j * tr_hat_w_sum
-        c45_const_b.value[j] = -coef_b_j * tr_hat_b_sum
+    c45_term4_const.value = sum_eta_ij_D_sen_vec * B * np.log2(Psi_j1_n_safe_vec)
+    c45_term5_const.value = sum_eta_ij_D_off_vec * B * np.log2(Psi_j2_n_safe_vec)
+    c45_coef_w.value = np.where(
+        sum_eta_ij_D_sen_vec > 0,
+        B * sum_eta_ij_D_sen_vec / (ln2 * Psi_j1_n_safe_vec),
+        0.0,
+    )
+    c45_coef_b.value = np.where(
+        sum_eta_ij_D_off_vec > 0,
+        B * sum_eta_ij_D_off_vec / (ln2 * Psi_j2_n_safe_vec),
+        0.0,
+    )
+    c45_const_w.value = -np.asarray(c45_coef_w.value, dtype=float) * tr_hat_w_sum_vec
+    c45_const_b.value = -np.asarray(c45_coef_b.value, dtype=float) * tr_hat_b_sum_vec
 
 
 def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs_norm, var_auxiliary_variable_z, var_cus_off_duration, var_t,
@@ -540,6 +602,10 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     uav_dist_diff = np.maximum(uav_dist_diff, epsilon)
     uav_fly_energy = ( (args.uav_c1 * (uav_dist_diff ** 3) / (args.time_slot_duration ** 2)) +
                       (args.uav_c2 * (args.time_slot_duration ** 2) / uav_dist_diff))
+    trace_sen_exprs = [cp.real(cp.trace(var_uavs_sen_beam[i])) for i in range(args.uavs_num)]
+    trace_off_exprs = [cp.real(cp.trace(var_uavs_off_beam[i])) for i in range(args.uavs_num)]
+    trace_sen_vec = cp.hstack(trace_sen_exprs)
+    trace_off_vec = cp.hstack(trace_off_exprs)
 
     # ==============================
     # 第一项
@@ -563,8 +629,8 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
     # ==============================
     for i in range(args.uavs_num):
         obj_fun += omega_weight_2 * (
-            args.uav_sen_duration * cp.real(cp.trace(var_uavs_sen_beam[i]))
-            + uavs_off_duration[i] * cp.real(cp.trace(var_uavs_off_beam[i]))
+            args.uav_sen_duration * trace_sen_exprs[i]
+            + uavs_off_duration[i] * trace_off_exprs[i]
             + uav_fly_energy[i]
         )
 
@@ -598,8 +664,8 @@ def compute_obj_fun(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_fre
 
             rank1_penalty_gap = (
                 cur_penalty_factor * (
-                    cp.real(cp.trace(var_uavs_sen_beam[i]))
-                    + cp.real(cp.trace(var_uavs_off_beam[i]))
+                    trace_sen_exprs[i]
+                    + trace_off_exprs[i]
                 )
                 - cp.real(cp.trace(v_w_scaled_matrix @ var_uavs_sen_beam[i]))
                 - cp.real(cp.trace(v_b_scaled_matrix @ var_uavs_off_beam[i]))
@@ -727,8 +793,9 @@ def compute_surrogate_rank1_penalty_value(cur_uavs_sen_beams, cur_uavs_off_beams
 
 
 def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_freqs_norm, var_auxiliary_variable_z, var_cus_off_duration, var_t,
-                      hat_uav_sen_beams, hat_uav_off_beams, cus_entertaining_task_size, uavs_off_duration, cus_off_power, matched_uav_sensing_channel,
-                      uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_cus_matched_matrix,
+                      first_iter_rank_boost_lb,
+                      hat_uav_sen_beams, hat_uav_off_beams, cus_entertaining_task_size, uavs_off_duration, cus_off_power,
+                      static_constraint_data,
                       c44_const_terms, c44_grad_mats, c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b):
     """
     定义问题 P6 的所有约束。
@@ -740,8 +807,8 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     I        = args.uavs_num
     J        = args.cus_num
     N        = args.antenna_nums
-    B        = args.bandwidth                                  # 带宽 (Hz)
-    sigma_2  = dbm_2_watt(args.noise_power_density_dbm) * B   # 噪声功率 σ²
+    B        = static_constraint_data["B"]
+    sigma_2  = static_constraint_data["sigma_2"]
     D_sen    = args.uav_sen_duration                           # D̄_sen
     D_max_ui = args.uav_max_delay                              # D^max_{u_i}
     D_max_cj = args.cu_max_delay                               # D^max_{c_j}
@@ -750,43 +817,21 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     F_max    = args.bs_max_freq                                # F^max
     eps_snr  = db_2_watt(args.sen_sinr)                        # 感知 SINR 门限 ε
 
-    # ── 雷达参数 ─────────────────────────────────────────────────────────────
-    # ξ1 = δ / (2ν)
-    xi1 = args.radar_duty_ratio / (2.0 * args.radar_impulse_duration)
-    # ξ2 = 2 σ²_pre γ² B³ ν
-    xi2 = (2.0 * args.var_range_fluctuation
-           * (args.radar_spectrum_shape ** 2)
-           * (args.bandwidth ** 3)
-           * args.radar_impulse_duration)
-
-    # ── 预计算 Δ_i ────────────────────────────────────────────
-    #
-    # Δ_i = Σ_{j=1}^{J} η_{i,j} · p_j · h_{u_i,c_j} · h^H_{u_i,c_j} + σ² I_N
-    #
-    # uavs_2_cus_channels shape: (I, J, N)，其中第三维为 UAV 天线个数 N
-    Delta_list = []
-    for i in range(I):
-        Delta_i = sigma_2 * np.eye(N, dtype=complex)           # σ² I_N
-        for j in range(J):
-            eta_ij = uavs_cus_matched_matrix[i, j]             # η_{i,j}
-            if eta_ij > 0:
-                h_ij   = uavs_2_cus_channels[i, j, :]          # h_{u_i,c_j}，shape (N,)
-                Delta_i = (Delta_i
-                           + eta_ij                             # η_{i,j}
-                           * cus_off_power[j]                  # · p_j
-                           * np.outer(h_ij, np.conj(h_ij)))    # · h_{u_i,c_j} h^H_{u_i,c_j}
-        Delta_list.append(Delta_i)
-
-    # ── 预计算 H_{u_i,BS} = h_{u_i,BS} h^H_{u_i,BS} ─────────────────────────
-    # uavs_2_bs_channels shape: (I, 1, N)
-    H_ui_BS_list = []
-    for i in range(I):
-        h_i = uavs_2_bs_channels[i, 0, :]                      # h_{u_i,BS}，shape (N,)
-        H_ui_BS_list.append(np.outer(h_i, np.conj(h_i)))       # H_{u_i,BS}，shape (N, N)
-
-    # ── 预计算 |h_{c_j,BS}|² ─────────────────────────────────────────────────
-    # cus_2_bs_channels shape: (J, 1)
-    h_cj_BS_sq = np.array([abs(cus_2_bs_channels[j, 0]) ** 2 for j in range(J)])
+    eye_n = static_constraint_data["eye_n"]
+    eta_matrix = static_constraint_data["eta_matrix"]
+    AH_Dinv_A_list = static_constraint_data["AH_Dinv_A_list"]
+    H_ui_BS_list = static_constraint_data["H_ui_BS_list"]
+    h_cj_BS_sq = static_constraint_data["h_cj_BS_sq"]
+    interf_plus_noise_vec = static_constraint_data["interf_plus_noise_vec"]
+    sum_eta_ij_D_sen_vec = static_constraint_data["sum_eta_ij_D_sen_vec"]
+    sum_eta_ij_D_off_vec = static_constraint_data["sum_eta_ij_D_off_vec"]
+    log2_cu_snr_vec = static_constraint_data["log2_cu_snr_vec"]
+    trace_sen_exprs = [cp.real(cp.trace(var_uavs_sen_beam[i])) for i in range(I)]
+    trace_off_exprs = [cp.real(cp.trace(var_uavs_off_beam[i])) for i in range(I)]
+    uav_bs_sen_gain_exprs = [cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_sen_beam[i])) for i in range(I)]
+    uav_bs_off_gain_exprs = [cp.real(cp.trace(H_ui_BS_list[i] @ var_uavs_off_beam[i])) for i in range(I)]
+    uav_bs_sen_gain_vec = cp.hstack(uav_bs_sen_gain_exprs)
+    uav_bs_off_gain_vec = cp.hstack(uav_bs_off_gain_exprs)
 
     # =========================================================================
     # 约束 (4.5)：D̄_sen + D^off_{u_i} - Σ_{j=1}^{J} η_{i,j} D^off_{c_j} ≤ 0，∀u_i ∈ U
@@ -796,7 +841,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
             D_sen                                               # D̄_sen
             + uavs_off_duration[i]                             # + D^off_{u_i}
             - cp.sum(                                          # - Σ_{j=1}^{J}
-                uavs_cus_matched_matrix[i, :] *                #   η_{i,j}
+                eta_matrix[i, :] *                             #   η_{i,j}
                 var_cus_off_duration                           #   · D^off_{c_j}
             )
             <= 0
@@ -820,20 +865,20 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     # 约束 (4.23)：W_i(t) ⪰ 0，∀u_i ∈ U
     # =========================================================================
     for i in range(I):
-        constraints.append(var_uavs_sen_beam[i] >> 0)
+        constraints.append(var_uavs_sen_beam[i] - first_iter_rank_boost_lb * eye_n >> 0)
 
     # =========================================================================
     # 约束 (4.25)：B_i(t) ⪰ 0，∀u_i ∈ U
     # =========================================================================
     for i in range(I):
-        constraints.append(var_uavs_off_beam[i] >> 0)
+        constraints.append(var_uavs_off_beam[i] - first_iter_rank_boost_lb * eye_n >> 0)
 
     # =========================================================================
     # 约束 (4.27)：Tr(W_i) - P^max_UAV ≤ 0，∀u_i ∈ U
     # =========================================================================
     for i in range(I):
         constraints.append(
-            cp.real(cp.trace(var_uavs_sen_beam[i]))            # Tr(W_i)
+            trace_sen_exprs[i]                                 # Tr(W_i)
             - P_max                                             # - P^max_UAV
             <= 0
         )
@@ -842,10 +887,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     # 约束 (4.28)：ε - Tr(A^H(θ_i) Δ^{-1}_i A(θ_i) W_i) ≤ 0，∀u_i ∈ U
     # =========================================================================
     for i in range(I):
-        A_i         = matched_uav_sensing_channel[i]            # A(θ_i)，shape (N, N)
-        Delta_i     = Delta_list[i]                             # Δ_i，shape (N, N)
-        Delta_i_inv = np.linalg.inv(Delta_i)                   # Δ^{-1}_i
-        AH_Dinv_A   = A_i.conj().T @ Delta_i_inv @ A_i         # A^H Δ^{-1} A，shape (N, N)
+        AH_Dinv_A   = AH_Dinv_A_list[i]                        # A^H Δ^{-1} A，shape (N, N)
         constraints.append(
             eps_snr                                             # ε
             - cp.real(cp.trace(                                 # - Tr(A^H Δ^{-1} A · W_i)
@@ -859,7 +901,7 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     # =========================================================================
     for i in range(I):
         constraints.append(
-            cp.real(cp.trace(var_uavs_off_beam[i]))            # Tr(B_i)
+            trace_off_exprs[i]                                 # Tr(B_i)
             - P_max                                             # - P^max_UAV
             <= 0
         )
@@ -872,14 +914,12 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
     #   ≤ 0，∀u_i ∈ U
     # =========================================================================
     for i in range(I):
-        H_i = H_ui_BS_list[i]                                  # H_{u_i,BS}，shape (N, N)
-
         # Σ_j η_{i,j} · p_j · |h_{c_j,BS}|² + σ²（常数）
-        interf_plus_noise = float(np.sum(uavs_cus_matched_matrix[i, :] * cus_off_power * h_cj_BS_sq)) + sigma_2
+        interf_plus_noise = interf_plus_noise_vec[i]
 
         constraints.append(
             D_sen * args.z_scale * var_auxiliary_variable_z[i]  # 20260321 - 修改了 obj5
-            - uavs_off_duration[i] * B * cp.log(cp.real(cp.trace(H_i @ var_uavs_off_beam[i]))+ interf_plus_noise) / np.log(2)
+            - uavs_off_duration[i] * B * cp.log(uav_bs_off_gain_exprs[i] + interf_plus_noise) / np.log(2)
             + uavs_off_duration[i] * B * np.log2(interf_plus_noise)                     
             <= 0
         )
@@ -951,17 +991,19 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         h_cj_sq = h_cj_BS_sq[j]                                # |h_{c_j,BS}|²
 
         # Σ_i η_{i,j} D̄_sen（常数系数）
-        sum_eta_ij_D_sen = D_sen * float(np.sum(uavs_cus_matched_matrix[:, j]))
+        sum_eta_ij_D_sen = sum_eta_ij_D_sen_vec[j]
         # Σ_i η_{i,j} D^off_{u_i}（常数系数）
-        sum_eta_ij_D_off = float(np.sum(uavs_cus_matched_matrix[:, j] * uavs_off_duration))
+        sum_eta_ij_D_off = sum_eta_ij_D_off_vec[j]
 
         # log2(1 + p_j |h_{c_j,BS}|² / σ²)（常数）
-        log2_cu_snr = np.log2(1.0 + p_j * h_cj_sq / sigma_2)
+        log2_cu_snr = log2_cu_snr_vec[j]
 
         # ── 构建含优化变量的 CVXPY 表达式 ────────────────────────────────────
         # Σ_i η_{i,j} Tr(H_{u_i,BS} W_i)（含优化变量，用于 log 的参数）
-        sum_eta_tr_H_W = 0.0
-        for i in range(I):
+        sum_eta_tr_H_W = cp.sum(
+            cp.multiply(eta_matrix[:, j], uav_bs_sen_gain_vec)
+        )
+        for i in range(0):
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
                 sum_eta_tr_H_W = (
@@ -973,8 +1015,10 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
                 )
 
         # Σ_i η_{i,j} Tr(H_{u_i,BS} B_i)（含优化变量，用于 log 的参数）
-        sum_eta_tr_H_B = 0.0
-        for i in range(I):
+        sum_eta_tr_H_B = cp.sum(
+            cp.multiply(eta_matrix[:, j], uav_bs_off_gain_vec)
+        )
+        for i in range(0):
             eta_ij = uavs_cus_matched_matrix[i, j]
             if eta_ij > 0:
                 sum_eta_tr_H_B = (
@@ -1024,12 +1068,12 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         term_4 = c45_term4_const[j]
         term_5 = c45_term5_const[j]
 
-        if sum_eta_ij_D_sen > 0 and not isinstance(sum_eta_tr_H_W, float):
+        if sum_eta_ij_D_sen > 0:
             term_6 = c45_coef_w[j] * sum_eta_tr_H_W + c45_const_w[j]
         else:
             term_6 = 0.0
 
-        if sum_eta_ij_D_off > 0 and not isinstance(sum_eta_tr_H_B, float):
+        if sum_eta_ij_D_off > 0:
             term_7 = c45_coef_b[j] * sum_eta_tr_H_B + c45_const_b[j]
         else:
             term_7 = 0.0
@@ -1055,16 +1099,22 @@ def define_constraint(args, var_uavs_sen_beam, var_uavs_off_beam, var_bs_2_uav_f
         )  # 20260321 - 修改了 obj5
     
     # 定义变量大于 0 
-    for i in range(I):
+    for i in range(0):
         constraints += [
             var_auxiliary_variable_z[i] >= 0,
             var_bs_2_uav_freqs_norm[i] >= 0,
             var_t[i] >= 0,
         ]
 
-    for j in range(J):
+    for j in range(0):
         constraints += [
             var_cus_off_duration[j] >= 0
+        ]
+
+    for i in range(0):
+        constraints += [
+            var_uavs_sen_beam[i] - first_iter_rank_boost_lb * np.eye(N) >> 0,
+            var_uavs_off_beam[i] - first_iter_rank_boost_lb * np.eye(N) >> 0,
         ]
 
     return constraints
@@ -1116,7 +1166,7 @@ def build_constraint_map(args, constraints):
     idx += J
     constraint_map["auxiliary_t"] = constraints[idx:idx + I]
     idx += I
-    constraint_map["var"] = constraints[idx:idx + I * 3 + J]
+    constraint_map["var"] = constraints[idx:]
     return constraint_map
 
 
@@ -1359,8 +1409,22 @@ def penalty_based_cccp(args,
     for i in range(args.uavs_num):
         hat_uav_sen_beams[i].value = temp_hat_uav_sen_beams[i]
         hat_uav_off_beams[i].value = temp_hat_uav_off_beams[i]
+    static_constraint_data = build_static_constraint_data(
+        args=args,
+        matched_uav_sensing_channel=matched_uav_sensing_channel,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+    )
     # 定义罚因子
     cur_penalty_factor = cp.Parameter(nonneg=True, value=args.penalty_factor)
+    first_iter_rank_boost_lb = cp.Parameter(
+        nonneg=True,
+        value=args.first_iter_rank_boost_eps if args.enable_first_iter_rank_boost else 0.0
+    )
     # 更新 rank-1 投影矩阵
     update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
                                           rank1_sen_proj_mats, rank1_off_proj_mats,
@@ -1369,8 +1433,7 @@ def penalty_based_cccp(args,
     update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
                                          obj5_coef_z, obj5_coef_f, obj5_const_terms)
     update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
-                                               matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
-                                               uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                               static_constraint_data,
                                                c44_const_terms, c44_grad_mats,
                                                c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
     
@@ -1414,16 +1477,13 @@ def penalty_based_cccp(args,
                                         var_auxiliary_variable_z=var_auxiliary_variable_z,
                                         var_cus_off_duration=var_cus_off_duration,
                                         var_t=var_t,
+                                        first_iter_rank_boost_lb=first_iter_rank_boost_lb,
                                         hat_uav_sen_beams=hat_uav_sen_beams,
                                         hat_uav_off_beams=hat_uav_off_beams,
                                         cus_entertaining_task_size=cus_entertaining_task_size,
                                         uavs_off_duration=uavs_off_duration,
                                         cus_off_power=cus_off_power,
-                                        matched_uav_sensing_channel=matched_uav_sensing_channel,
-                                        uavs_2_cus_channels=uavs_2_cus_channels,
-                                        uavs_2_bs_channels=uavs_2_bs_channels,
-                                        cus_2_bs_channels=cus_2_bs_channels,
-                                        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+                                        static_constraint_data=static_constraint_data,
                                         c44_const_terms=c44_const_terms,
                                         c44_grad_mats=c44_grad_mats,
                                         c45_term4_const=c45_term4_const,
@@ -1441,7 +1501,7 @@ def penalty_based_cccp(args,
     # print(f"启用约束组: {active_groups}")
     # NOTE - 定义为 DPP，加速求解
     problem = cp.Problem(cp.Minimize(obj_fun), constraints)
-    # print(f"是否定义为 DPP : {problem.is_dcp(dpp=True)}")  # 检测是否为 DPP
+    print(f"是否定义为 DPP : {problem.is_dcp(dpp=True)}")  # 检测是否为 DPP
     rank1_gap_max = float('inf')
     energy_val_list = []
     rank1_val_list = []
@@ -1489,6 +1549,7 @@ def penalty_based_cccp(args,
                     uavs_pos_cur=uavs_pos_cur
                 )
                 print(f"第 {iter_count} 轮当前状态 : {problem.status}")
+                print(f"第 {iter_count} 轮当前解 : {problem.value}")
                 print(f"第 {iter_count} 轮原始问题的最优值:", cur_original_obj_fun_val)
                 print(f"第 {iter_count} 轮不考虑罚函数下的纯能耗值:", cur_pure_energy_val)
             for i in range(args.uavs_num):
@@ -1508,6 +1569,9 @@ def penalty_based_cccp(args,
             energy_val_list.append(cur_pure_energy_val)
             rank1_val_list.append(cur_rank1_sum)
 
+            if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
+                first_iter_rank_boost_lb.value = 0.0
+
             obj_fun_opt = cur_original_obj_fun_val
             if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
                 print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_original_obj_fun_val)
@@ -1521,8 +1585,7 @@ def penalty_based_cccp(args,
             update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
                                                     obj5_coef_z, obj5_coef_f, obj5_const_terms)
             update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
-                                                        matched_uav_sensing_channel, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels,
-                                                        uavs_cus_matched_matrix, uavs_off_duration, cus_off_power,
+                                                        static_constraint_data,
                                                         c44_const_terms, c44_grad_mats,
                                                         c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
             if args.enable_cccp_diagnostics == True:
@@ -1611,7 +1674,7 @@ if __name__ == "__main__":
     cus_off_power = np.full(args.cus_num, dbm_2_watt(args.cu_max_power_dbm) / 5)
     cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
     
-    rho_list = [10]
+    rho_list = [1]
 
     for rho in rho_list:
         args.penalty_factor = rho
