@@ -69,9 +69,9 @@ def get_base_args():
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
 
     # 基于惩罚的 CCCP 算法参数
-    base_parser.add_argument("--max_iterations", type=int, default=15, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--max_iterations", type=int, default=10, help="CCCP 算法最大迭代次数")
     base_parser.add_argument("--cccp_threshold", type=float, default=1e-6, help="CCCP 算法目标函数收敛阈值")
-    base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
+    base_parser.add_argument("--rank1_threshold", type=float, default=1e-6, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
     base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
@@ -378,36 +378,19 @@ def compute_uav_pos_cur(args, uavs_pos_pre):
 def initialize_uav_beams(args, matched_uav_sensing_channel, uavs_2_bs_channels):
     hat_uav_sen_beams = []
     hat_uav_off_beams = []
+    full_rank_init = (args.uav_max_power / args.antenna_nums) * np.eye(args.antenna_nums, dtype=complex)
 
     # ==============================
     # 初始化 UAV 感知波束
     # ==============================
     for i in range(args.uavs_num):
-        H_i = matched_uav_sensing_channel[i]  # (N,N)
-
-        w_init = compute_largest_eigenvector(H_i)
-
-        W_init = np.outer(w_init, np.conj(w_init))
-
-        W_init = args.uav_max_power * W_init / np.trace(W_init)
-
-        hat_uav_sen_beams.append(W_init)
+        hat_uav_sen_beams.append(full_rank_init.copy())
 
     # ==============================
     # 初始化 UAV 卸载感知任务波束
     # ==============================
     for i in range(args.uavs_num):
-        h_i = uavs_2_bs_channels[i, 0, :]  # (N,)
-
-        H_i = np.outer(h_i, np.conj(h_i))
-
-        w_init = compute_largest_eigenvector(H_i)
-
-        W_init = np.outer(w_init, np.conj(w_init))
-
-        W_init = args.uav_max_power * W_init / np.trace(W_init)
-
-        hat_uav_off_beams.append(W_init)
+        hat_uav_off_beams.append(full_rank_init.copy())
 
     return hat_uav_sen_beams, hat_uav_off_beams
 
@@ -1467,7 +1450,7 @@ def penalty_based_cccp(args,
         pre_original_obj_fun_val = float('inf')
         for inner_iter in range(args.max_iterations):
             print(f"-------------------- 第 {iter_count + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
-            problem.solve(solver=cp.MOSEK, warm_start=True, verbose=False)
+            problem.solve(solver=cp.MOSEK, warm_start=True, canon_backend="COO", verbose=False)
             print("compilation_time =", problem.compilation_time)
             print("solve_time =", problem.solver_stats.solve_time)
             print("num_iters =", problem.solver_stats.num_iters)
@@ -1514,18 +1497,21 @@ def penalty_based_cccp(args,
             hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
             hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
             rank1_gap_max = 0.0
+            cur_rank1_sum = 0.0
             for i in range(args.uavs_num):
                 w_gap = np.real(np.trace(var_uavs_sen_beam[i].value)) - np.linalg.norm(var_uavs_sen_beam[i].value, 2)
                 b_gap = np.real(np.trace(var_uavs_off_beam[i].value)) - np.linalg.norm(var_uavs_off_beam[i].value, 2)
+                cur_rank1_sum += w_gap + b_gap
                 rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
             print(f"第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
+            print(f"第 {iter_count} 轮 rank1 gap 总和:", cur_rank1_sum)
             energy_val_list.append(cur_pure_energy_val)
-            rank1_val_list.append(rank1_gap_max)
+            rank1_val_list.append(cur_rank1_sum)
 
             obj_fun_opt = cur_original_obj_fun_val
             if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
                 print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_original_obj_fun_val)
-                print(f" Convergency!!! - 第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
+                print(f" Convergency!!! - 第 {iter_count} 轮rank1 gap 总和:", cur_rank1_sum)
                 break
             pre_original_obj_fun_val = cur_original_obj_fun_val
             update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
