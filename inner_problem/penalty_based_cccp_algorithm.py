@@ -85,6 +85,8 @@ def get_base_args():
                              help="开关参数")
     base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
                              help="强度参数")
+    base_parser.add_argument("--solver_backend", type=str, default="fusion", choices=["fusion", "cvxpy"],
+                             help="是否采用 Fusion 求解器，默认为 True（使用 Mosek Fusion），否则使用 CVXPY（默认使用 Mosek 作为 CVXPY 的求解器）")
     return base_parser.parse_args()
 
 
@@ -102,6 +104,40 @@ def compute_largest_eigenvector(matrix):
     v_max = eigenvectors[:, -1]
     # 返回最大特征值对应的特征向量
     return v_max
+
+
+def complex_to_real_lift(matrix):
+    matrix = np.asarray(matrix)
+    real_part = np.real(matrix)
+    imag_part = np.imag(matrix)
+    return np.block([
+        [real_part, -imag_part],
+        [imag_part, real_part],
+    ]).astype(float, copy=False)
+
+
+def real_lift_to_complex_matrix(matrix):
+    matrix = np.asarray(matrix, dtype=float)
+    lifted_dim = matrix.shape[0]
+    if lifted_dim % 2 != 0:
+        raise ValueError(f"lifted matrix dimension must be even, got {lifted_dim}")
+    n = lifted_dim // 2
+    real_part = matrix[:n, :n]
+    imag_part = matrix[n:, :n]
+    complex_matrix = real_part + 1j * imag_part
+    return (complex_matrix + complex_matrix.conj().T) / 2
+
+
+def _import_mosek_fusion():
+    try:
+        import mosek.fusion as mf
+        import mosek.fusion.pythonic  # noqa: F401
+    except Exception as exc:
+        raise ImportError(
+            "Fusion backend requires the Python package 'mosek'. "
+            "Please install the MOSEK Python API in the same environment."
+        ) from exc
+    return mf
 
 
 def generate_pos(uavs_num, cus_num, targets_num, center, radius, uav_height):
@@ -1338,6 +1374,484 @@ def probe_group_feasibility(constraint_map, active_groups, solver):
     return probe_rows
 
 
+def resolve_active_constraint_groups(args):
+    all_groups = ["4.5", "4.12", "4.23", "4.25", "4.27", "4.28", "4.29", "4.32", "4.39", "4.40", "4.44", "4.45", "auxiliary_t", "var"]
+    include_groups = parse_group_list(args.constraint_include_groups)
+    exclude_groups = parse_group_list(args.constraint_exclude_groups)
+    unknown_include = [] if include_groups is None else [g for g in include_groups if g not in all_groups]
+    unknown_exclude = [] if exclude_groups is None else [g for g in exclude_groups if g not in all_groups]
+    if len(unknown_include) > 0 or len(unknown_exclude) > 0:
+        raise ValueError(f"传参错误:include={unknown_include}, exclude={unknown_exclude}, 可选组={all_groups}")
+
+    active_groups = all_groups if include_groups is None else [g for g in all_groups if g in include_groups]
+    if exclude_groups is not None:
+        active_groups = [g for g in active_groups if g not in exclude_groups]
+    return active_groups
+
+
+def _fusion_extract_matrix_level(var, dim):
+    return np.asarray(var.level(), dtype=float).reshape(dim, dim)
+
+
+def solve_inner_problem_with_fusion(args, active_groups, static_constraint_data,
+                                    hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                    hat_uav_sen_beams, hat_uav_off_beams,
+                                    rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats, rank1_const_terms,
+                                    obj5_coef_z, obj5_coef_f, obj5_const_terms,
+                                    c44_const_terms, c44_grad_mats,
+                                    c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b,
+                                    cur_penalty_factor, first_iter_rank_boost_lb,
+                                    cus_entertaining_task_size, uavs_off_duration, cus_off_power,
+                                    uavs_pos_pre, uavs_pos_cur, use_penalty_rank1):
+    mf = _import_mosek_fusion()
+    if "4.23" not in active_groups or "4.25" not in active_groups:
+        raise NotImplementedError("Fusion backend currently requires constraint groups 4.23 and 4.25 to remain enabled.")
+
+    build_start = time.perf_counter()
+    I = args.uavs_num
+    J = args.cus_num
+    N = args.antenna_nums
+    lifted_dim = 2 * N
+    ln2 = np.log(2.0)
+
+    B = static_constraint_data["B"]
+    sigma_2 = static_constraint_data["sigma_2"]
+    eye_lift = np.eye(lifted_dim, dtype=float)
+    eta_matrix = static_constraint_data["eta_matrix"]
+    h_cj_BS_sq = static_constraint_data["h_cj_BS_sq"]
+    interf_plus_noise_vec = static_constraint_data["interf_plus_noise_vec"]
+    sum_eta_ij_D_sen_vec = static_constraint_data["sum_eta_ij_D_sen_vec"]
+    sum_eta_ij_D_off_vec = static_constraint_data["sum_eta_ij_D_off_vec"]
+    log2_cu_snr_vec = static_constraint_data["log2_cu_snr_vec"]
+
+    H_ui_BS_lift_list = [complex_to_real_lift(mat) for mat in static_constraint_data["H_ui_BS_list"]]
+    AH_Dinv_A_lift_list = [complex_to_real_lift(mat) for mat in static_constraint_data["AH_Dinv_A_list"]]
+    c44_grad_lift_list = [complex_to_real_lift(param.value) for param in c44_grad_mats]
+    rank1_sen_scaled_lift_list = [complex_to_real_lift(param.value) for param in rank1_sen_scaled_proj_mats]
+    rank1_off_scaled_lift_list = [complex_to_real_lift(param.value) for param in rank1_off_scaled_proj_mats]
+
+    D_sen = args.uav_sen_duration
+    D_max_ui = args.uav_max_delay
+    D_max_cj = args.cu_max_delay
+    C_bit = args.bs_cycles_per_bit
+    P_max = args.uav_max_power
+    F_max = args.bs_max_freq
+    eps_snr = db_2_watt(args.sen_sinr)
+    eps_strict = 1e-10
+
+    uavs_pos_cur = np.asarray(uavs_pos_cur, dtype=float)
+    uavs_pos_pre = np.asarray(uavs_pos_pre, dtype=float)
+    uav_dist_diff = np.linalg.norm(uavs_pos_cur - uavs_pos_pre, axis=1)
+    uav_dist_diff = np.maximum(uav_dist_diff, 1e-8)
+    uav_fly_energy = ((args.uav_c1 * (uav_dist_diff ** 3) / (args.time_slot_duration ** 2)) +
+                      (args.uav_c2 * (args.time_slot_duration ** 2) / uav_dist_diff))
+
+    obj1_beta = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration * args.z_scale * (args.freq_scale ** 2)
+
+    with mf.Model("penalty_cccp_fusion") as model:
+        W_vars = [model.variable(f"W_{i}", mf.Domain.inPSDCone(lifted_dim)) for i in range(I)]
+        B_vars = [model.variable(f"B_{i}", mf.Domain.inPSDCone(lifted_dim)) for i in range(I)]
+        f_var = model.variable("f", I, mf.Domain.greaterThan(0.0))
+        z_var = model.variable("z", I, mf.Domain.greaterThan(0.0))
+        d_var = model.variable("d", J, mf.Domain.greaterThan(0.0))
+        t_var = model.variable("t", I, mf.Domain.greaterThan(0.0))
+        qt_var = model.variable("qt", I, mf.Domain.greaterThan(0.0))
+        rinv_var = model.variable("rinv", J, mf.Domain.greaterThan(0.0))
+        qinv_var = model.variable("qinv", J, mf.Domain.greaterThan(0.0))
+        log_sen_var = model.variable("log_sen", J)
+        log_off_var = model.variable("log_off", J)
+
+        trace_sen_exprs = []
+        trace_off_exprs = []
+        uav_bs_sen_gain_exprs = []
+        uav_bs_off_gain_exprs = []
+        for i in range(I):
+            W_i = W_vars[i]
+            B_i = B_vars[i]
+            trace_sen_exprs.append(0.5 * mf.Expr.dot(eye_lift, W_i))
+            trace_off_exprs.append(0.5 * mf.Expr.dot(eye_lift, B_i))
+            uav_bs_sen_gain_exprs.append(0.5 * mf.Expr.dot(H_ui_BS_lift_list[i], W_i))
+            uav_bs_off_gain_exprs.append(0.5 * mf.Expr.dot(H_ui_BS_lift_list[i], B_i))
+
+            W11 = W_i.slice([0, 0], [N, N])
+            W22 = W_i.slice([N, N], [lifted_dim, lifted_dim])
+            W12 = W_i.slice([0, N], [N, lifted_dim])
+            W21 = W_i.slice([N, 0], [lifted_dim, N])
+            B11 = B_i.slice([0, 0], [N, N])
+            B22 = B_i.slice([N, N], [lifted_dim, lifted_dim])
+            B12 = B_i.slice([0, N], [N, lifted_dim])
+            B21 = B_i.slice([N, 0], [lifted_dim, N])
+            model.constraint(W11 - W22, mf.Domain.equalsTo(0.0))
+            model.constraint(W12 + W21, mf.Domain.equalsTo(0.0))
+            model.constraint(B11 - B22, mf.Domain.equalsTo(0.0))
+            model.constraint(B12 + B21, mf.Domain.equalsTo(0.0))
+
+            if "4.23" in active_groups:
+                model.constraint(W_i - float(first_iter_rank_boost_lb.value) * eye_lift, mf.Domain.inPSDCone(lifted_dim))
+            if "4.25" in active_groups:
+                model.constraint(B_i - float(first_iter_rank_boost_lb.value) * eye_lift, mf.Domain.inPSDCone(lifted_dim))
+
+            model.constraint(mf.Expr.vstack(0.5, qt_var.index(i), t_var.index(i)), mf.Domain.inRotatedQCone())
+            if "auxiliary_t" in active_groups:
+                model.constraint(mf.Expr.vstack(0.5, t_var.index(i) - z_var.index(i), f_var.index(i)), mf.Domain.inRotatedQCone())
+
+        for j in range(J):
+            delay_margin_expr = D_max_cj - d_var.index(j)
+            model.constraint(mf.Expr.vstack(delay_margin_expr, rinv_var.index(j), np.sqrt(2.0)), mf.Domain.inRotatedQCone())
+            model.constraint(mf.Expr.vstack(0.5, qinv_var.index(j), rinv_var.index(j)), mf.Domain.inRotatedQCone())
+
+        for i in range(I):
+            if "4.5" in active_groups:
+                model.constraint(D_sen + uavs_off_duration[i] - mf.Expr.dot(eta_matrix[i, :], d_var), mf.Domain.lessThan(0.0))
+            if "4.12" in active_groups:
+                lhs_412 = (
+                    D_sen * args.freq_scale * f_var.index(i)
+                    + uavs_off_duration[i] * args.freq_scale * f_var.index(i)
+                    - D_max_ui * args.freq_scale * f_var.index(i)
+                    + C_bit * D_sen * args.z_scale * z_var.index(i)
+                )
+                model.constraint(lhs_412, mf.Domain.lessThan(0.0))
+            if "4.27" in active_groups:
+                model.constraint(trace_sen_exprs[i] - P_max, mf.Domain.lessThan(0.0))
+            if "4.28" in active_groups:
+                model.constraint(eps_snr - 0.5 * mf.Expr.dot(AH_Dinv_A_lift_list[i], W_vars[i]), mf.Domain.lessThan(0.0))
+            if "4.29" in active_groups:
+                model.constraint(trace_off_exprs[i] - P_max, mf.Domain.lessThan(0.0))
+            if "4.32" in active_groups:
+                log_arg_expr = uav_bs_off_gain_exprs[i] + interf_plus_noise_vec[i]
+                log_coef = uavs_off_duration[i] * B / ln2
+                affine_part = D_sen * args.z_scale * z_var.index(i) + uavs_off_duration[i] * B * np.log2(interf_plus_noise_vec[i])
+                model.constraint(mf.Expr.hstack(log_arg_expr, 1.0, affine_part / log_coef), mf.Domain.inPExpCone())
+            if "4.44" in active_groups:
+                lhs_44 = c44_const_terms.value[i] - args.z_scale * z_var.index(i) + 0.5 * mf.Expr.dot(c44_grad_lift_list[i], W_vars[i])
+                model.constraint(lhs_44, mf.Domain.lessThan(0.0))
+
+        if "4.39" in active_groups:
+            for j in range(J):
+                model.constraint(d_var.index(j) - D_max_cj + eps_strict, mf.Domain.lessThan(0.0))
+
+        if "4.40" in active_groups:
+            sum_freq_expr = args.freq_scale * mf.Expr.sum(f_var)
+            for j in range(J):
+                sum_freq_expr = sum_freq_expr + C_bit * cus_entertaining_task_size[j] * rinv_var.index(j)
+            model.constraint(sum_freq_expr - F_max, mf.Domain.lessThan(0.0))
+
+        if "4.45" in active_groups:
+            for j in range(J):
+                sum_eta_tr_H_W = 0.0
+                sum_eta_tr_H_B = 0.0
+                for i in range(I):
+                    if eta_matrix[i, j] > 0:
+                        sum_eta_tr_H_W = sum_eta_tr_H_W + float(eta_matrix[i, j]) * uav_bs_sen_gain_exprs[i]
+                        sum_eta_tr_H_B = sum_eta_tr_H_B + float(eta_matrix[i, j]) * uav_bs_off_gain_exprs[i]
+
+                p_j = cus_off_power[j]
+                h_cj_sq = h_cj_BS_sq[j]
+                sum_eta_ij_D_sen = sum_eta_ij_D_sen_vec[j]
+                sum_eta_ij_D_off = sum_eta_ij_D_off_vec[j]
+                x1_expr = p_j * h_cj_sq + sum_eta_tr_H_W + sigma_2
+                x2_expr = p_j * h_cj_sq + sum_eta_tr_H_B + sigma_2
+
+                if sum_eta_ij_D_sen > 0:
+                    model.constraint(mf.Expr.hstack(x1_expr, 1.0, log_sen_var.index(j)), mf.Domain.inPExpCone())
+                if sum_eta_ij_D_off > 0:
+                    model.constraint(mf.Expr.hstack(x2_expr, 1.0, log_off_var.index(j)), mf.Domain.inPExpCone())
+
+                lhs_45 = (
+                    cus_entertaining_task_size[j]
+                    - B * log2_cu_snr_vec[j] * d_var.index(j)
+                    + (sum_eta_ij_D_sen + sum_eta_ij_D_off) * B * log2_cu_snr_vec[j]
+                    + c45_term4_const.value[j]
+                    + c45_term5_const.value[j]
+                    + c45_const_w.value[j]
+                    + c45_const_b.value[j]
+                    + c45_coef_w.value[j] * sum_eta_tr_H_W
+                    + c45_coef_b.value[j] * sum_eta_tr_H_B
+                )
+                if sum_eta_ij_D_sen > 0:
+                    lhs_45 = lhs_45 - (sum_eta_ij_D_sen * B / ln2) * log_sen_var.index(j)
+                if sum_eta_ij_D_off > 0:
+                    lhs_45 = lhs_45 - (sum_eta_ij_D_off * B / ln2) * log_off_var.index(j)
+                model.constraint(lhs_45, mf.Domain.lessThan(0.0))
+
+        obj_expr = 0.0
+        for i in range(I):
+            obj_expr = (
+                obj_expr
+                + 0.5 * obj1_beta * qt_var.index(i)
+                + obj5_coef_z.value[i] * z_var.index(i)
+                + obj5_coef_f.value[i] * f_var.index(i)
+                + obj5_const_terms.value[i]
+                + args.omega_weight_2 * (D_sen * trace_sen_exprs[i] + uavs_off_duration[i] * trace_off_exprs[i] + uav_fly_energy[i])
+            )
+        for j in range(J):
+            cu_obj_coef = args.omega_weight_1 * args.kappa * ((args.bs_cycles_per_bit * cus_entertaining_task_size[j]) ** 3)
+            obj_expr = obj_expr + cu_obj_coef * qinv_var.index(j) + args.omega_weight_3 * cus_off_power[j] * d_var.index(j)
+        if use_penalty_rank1:
+            rho = float(cur_penalty_factor.value)
+            for i in range(I):
+                obj_expr = (
+                    obj_expr
+                    + rho * (trace_sen_exprs[i] + trace_off_exprs[i])
+                    - 0.5 * mf.Expr.dot(rank1_sen_scaled_lift_list[i], W_vars[i])
+                    - 0.5 * mf.Expr.dot(rank1_off_scaled_lift_list[i], B_vars[i])
+                    + float(rank1_const_terms.value[i])
+                )
+        model.objective(mf.ObjectiveSense.Minimize, obj_expr)
+
+        build_time = time.perf_counter() - build_start
+        solve_start = time.perf_counter()
+        model.solve()
+        solve_wall_time = time.perf_counter() - solve_start
+
+        try:
+            solve_time = float(model.getSolverDoubleInfo("optimizerTime"))
+        except Exception:
+            solve_time = solve_wall_time
+        try:
+            num_iters = int(model.getSolverIntInfo("intpntIter"))
+        except Exception:
+            num_iters = -1
+
+        problem_status = str(model.getProblemStatus())
+        solution_status = str(model.getPrimalSolutionStatus())
+
+        sen_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(W_vars[i], lifted_dim)) for i in range(I)]
+        off_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(B_vars[i], lifted_dim)) for i in range(I)]
+
+        return {
+            "status": solution_status,
+            "problem_status": problem_status,
+            "objective_value": float(model.primalObjValue()),
+            "uavs_sen_beams": sen_beams,
+            "uavs_off_beams": off_beams,
+            "bs_2_uav_freqs_norm": np.asarray(f_var.level(), dtype=float),
+            "auxiliary_variable_z": np.asarray(z_var.level(), dtype=float),
+            "cus_off_duration": np.asarray(d_var.level(), dtype=float),
+            "t": np.asarray(t_var.level(), dtype=float),
+            "build_time": float(build_time),
+            "solve_time": float(solve_time),
+            "num_iters": num_iters,
+        }
+
+
+def penalty_based_cccp_fusion(args,
+                              uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
+                              uavs_targets_matched_matrix, uavs_cus_matched_matrix,
+                              uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power,
+                              use_penalty_rank1=True,
+                              cus_entertaining_task_size=None):
+    """
+    基于惩罚的 CCCP 算法求解器，使用 MOSEK Fusion 作为子问题求解器
+    """
+    if cus_entertaining_task_size is None:
+        cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+
+    matched_uav_sensing_channel = extract_matched_sensing_channel(
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_2_targets_channels=uavs_2_targets_channels
+    )
+
+    hat_auxiliary_variable_z = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (1e5 / args.z_scale))
+    hat_bs_2_uav_freqs_norm = cp.Parameter(args.uavs_num, nonneg=True, value=np.ones(args.uavs_num) * (args.bs_max_freq / args.freq_scale / args.uavs_num / 2))
+    hat_uav_sen_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    hat_uav_off_beams = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_sen_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_off_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_sen_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_off_scaled_proj_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums, args.antenna_nums)) for _ in range(args.uavs_num)]
+    rank1_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_z = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_coef_f = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    obj5_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_const_terms = cp.Parameter(args.uavs_num, value=np.zeros(args.uavs_num))
+    c44_grad_mats = [cp.Parameter((args.antenna_nums, args.antenna_nums), hermitian=True, value=np.eye(args.antenna_nums)) for _ in range(args.uavs_num)]
+    c45_term4_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_term5_const = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_coef_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_w = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+    c45_const_b = cp.Parameter(args.cus_num, value=np.zeros(args.cus_num))
+
+    temp_hat_uav_sen_beams, temp_hat_uav_off_beams = initialize_uav_beams(
+        args=args,
+        matched_uav_sensing_channel=matched_uav_sensing_channel,
+        uavs_2_bs_channels=uavs_2_bs_channels
+    )
+    for i in range(args.uavs_num):
+        hat_uav_sen_beams[i].value = temp_hat_uav_sen_beams[i]
+        hat_uav_off_beams[i].value = temp_hat_uav_off_beams[i]
+
+    static_constraint_data = build_static_constraint_data(
+        args=args,
+        matched_uav_sensing_channel=matched_uav_sensing_channel,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+    )
+    active_groups = resolve_active_constraint_groups(args)
+
+    cur_penalty_factor = cp.Parameter(nonneg=True, value=args.penalty_factor)
+    first_iter_rank_boost_lb = cp.Parameter(
+        nonneg=True,
+        value=args.first_iter_rank_boost_eps if args.enable_first_iter_rank_boost else 0.0
+    )
+
+    update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                          rank1_sen_proj_mats, rank1_off_proj_mats,
+                                          cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                          rank1_const_terms)
+    update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                         obj5_coef_z, obj5_coef_f, obj5_const_terms)
+    update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                               static_constraint_data,
+                                               c44_const_terms, c44_grad_mats,
+                                               c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
+
+    print("-------------------------------------------------------- ")
+    print(f"-------------------- CCCP求解开始-------------------- ")
+    print("-------------------------------------------------------- ")
+    print("Fusion backend is enabled. CCCP diagnostics based on CVXPY violation() are skipped.")
+
+    iter_count = 0
+    obj_fun_opt = float('inf')
+    rank1_gap_max = float('inf')
+    energy_val_list = []
+    rank1_val_list = []
+    cur_original_obj_fun_val = float('inf')
+
+    for outer_iter in range(args.max_iterations):
+        pre_original_obj_fun_val = float('inf')
+        for inner_iter in range(args.max_iterations):
+            print(f"-------------------- 第 {iter_count + 1} 次迭代，rho = {cur_penalty_factor.value:.4e} --------------------")
+            fusion_result = solve_inner_problem_with_fusion(
+                args=args,
+                active_groups=active_groups,
+                static_constraint_data=static_constraint_data,
+                hat_auxiliary_variable_z=hat_auxiliary_variable_z,
+                hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
+                hat_uav_sen_beams=hat_uav_sen_beams,
+                hat_uav_off_beams=hat_uav_off_beams,
+                rank1_sen_scaled_proj_mats=rank1_sen_scaled_proj_mats,
+                rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
+                rank1_const_terms=rank1_const_terms,
+                obj5_coef_z=obj5_coef_z,
+                obj5_coef_f=obj5_coef_f,
+                obj5_const_terms=obj5_const_terms,
+                c44_const_terms=c44_const_terms,
+                c44_grad_mats=c44_grad_mats,
+                c45_term4_const=c45_term4_const,
+                c45_term5_const=c45_term5_const,
+                c45_coef_w=c45_coef_w,
+                c45_coef_b=c45_coef_b,
+                c45_const_w=c45_const_w,
+                c45_const_b=c45_const_b,
+                cur_penalty_factor=cur_penalty_factor,
+                first_iter_rank_boost_lb=first_iter_rank_boost_lb,
+                cus_entertaining_task_size=cus_entertaining_task_size,
+                uavs_off_duration=uavs_off_duration,
+                cus_off_power=cus_off_power,
+                uavs_pos_pre=uavs_pos_pre,
+                uavs_pos_cur=uavs_pos_cur,
+                use_penalty_rank1=use_penalty_rank1,
+            )
+            print("compilation_time =", fusion_result["build_time"])
+            print("solve_time =", fusion_result["solve_time"])
+            print("num_iters =", fusion_result["num_iters"])
+            iter_count += 1
+
+            cur_surrogate_opt_val = float(np.real(fusion_result["objective_value"]))
+            cur_uavs_sen_beams = fusion_result["uavs_sen_beams"]
+            cur_uavs_off_beams = fusion_result["uavs_off_beams"]
+            cur_bs_2_uav_freqs_norm = fusion_result["bs_2_uav_freqs_norm"]
+            cur_auxiliary_variable_z = fusion_result["auxiliary_variable_z"]
+            cur_cus_off_duration = fusion_result["cus_off_duration"]
+
+            cur_original_obj_fun_val = compute_original_obj_fun_value(
+                args=args,
+                cur_uavs_sen_beams=cur_uavs_sen_beams,
+                cur_uavs_off_beams=cur_uavs_off_beams,
+                cur_bs_2_uav_freqs_norm=cur_bs_2_uav_freqs_norm,
+                cur_auxiliary_variable_z=cur_auxiliary_variable_z,
+                cur_cus_off_duration=cur_cus_off_duration,
+                cus_entertaining_task_size=cus_entertaining_task_size,
+                uavs_off_duration=uavs_off_duration,
+                cus_off_power=cus_off_power,
+                uavs_pos_pre=uavs_pos_pre,
+                uavs_pos_cur=uavs_pos_cur,
+                cur_penalty_factor=cur_penalty_factor.value,
+                use_penalty_rank1=use_penalty_rank1
+            )
+            cur_pure_energy_val = compute_pure_energy_value(
+                args=args,
+                cur_uavs_sen_beams=cur_uavs_sen_beams,
+                cur_uavs_off_beams=cur_uavs_off_beams,
+                cur_bs_2_uav_freqs_norm=cur_bs_2_uav_freqs_norm,
+                cur_auxiliary_variable_z=cur_auxiliary_variable_z,
+                cur_cus_off_duration=cur_cus_off_duration,
+                cus_entertaining_task_size=cus_entertaining_task_size,
+                uavs_off_duration=uavs_off_duration,
+                cus_off_power=cus_off_power,
+                uavs_pos_pre=uavs_pos_pre,
+                uavs_pos_cur=uavs_pos_cur
+            )
+            print(f"第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
+            print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+            print(f"第 {iter_count} 轮 原始目标函数值", cur_original_obj_fun_val)
+            print(f"第 {iter_count} 轮 不包含罚函数的目标函数值", cur_pure_energy_val)
+
+            for i in range(args.uavs_num):
+                hat_uav_sen_beams[i].value = cur_uavs_sen_beams[i]
+                hat_uav_off_beams[i].value = cur_uavs_off_beams[i]
+            hat_auxiliary_variable_z.value = cur_auxiliary_variable_z
+            hat_bs_2_uav_freqs_norm.value = cur_bs_2_uav_freqs_norm
+
+            rank1_gap_max = 0.0
+            cur_rank1_sum = 0.0
+            for i in range(args.uavs_num):
+                w_gap = np.real(np.trace(cur_uavs_sen_beams[i])) - np.linalg.norm(cur_uavs_sen_beams[i], 2)
+                b_gap = np.real(np.trace(cur_uavs_off_beams[i])) - np.linalg.norm(cur_uavs_off_beams[i], 2)
+                cur_rank1_sum += w_gap + b_gap
+                rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
+            print(f"第 {iter_count} 轮 最大rank1 gap:", rank1_gap_max)
+            print(f"第 {iter_count} 轮 总rank1 gap:", cur_rank1_sum)
+            energy_val_list.append(cur_pure_energy_val)
+            rank1_val_list.append(cur_rank1_sum)
+
+            if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
+                first_iter_rank_boost_lb.value = 0.0
+
+            obj_fun_opt = cur_original_obj_fun_val
+            if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
+                print(f" Convergency!!! - 第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
+                print(f" Convergency!!! - 第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+                break
+            pre_original_obj_fun_val = cur_original_obj_fun_val
+
+            update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                  rank1_sen_proj_mats, rank1_off_proj_mats,
+                                                  cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                                  rank1_const_terms)
+            update_obj5_linearization_parameters(args, hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
+                                                 obj5_coef_z, obj5_coef_f, obj5_const_terms)
+            update_constraint_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                                       static_constraint_data,
+                                                       c44_const_terms, c44_grad_mats,
+                                                       c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
+        if rank1_gap_max < args.rank1_threshold:
+            break
+        cur_penalty_factor.value *= args.zoom_factor
+        update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
+                                              rank1_sen_proj_mats, rank1_off_proj_mats,
+                                              cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
+                                              rank1_const_terms)
+
+    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list
+
+
 def penalty_based_cccp(args,
                        uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
                        uavs_targets_matched_matrix, uavs_cus_matched_matrix,
@@ -1361,6 +1875,23 @@ def penalty_based_cccp(args,
     :param cus_off_power: CUs 娱乐任务卸载功率 (维度: J) (DRL 输出)
     :return: 目标函数总延迟
     """
+    if str(args.solver_backend).lower() == "fusion":
+        return penalty_based_cccp_fusion(
+            args=args,
+            uavs_2_cus_channels=uavs_2_cus_channels,
+            uavs_2_bs_channels=uavs_2_bs_channels,
+            cus_2_bs_channels=cus_2_bs_channels,
+            uavs_2_targets_channels=uavs_2_targets_channels,
+            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+            uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            use_penalty_rank1=use_penalty_rank1,
+            cus_entertaining_task_size=cus_entertaining_task_size
+        )
+
     if cus_entertaining_task_size is None:
         cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
     
