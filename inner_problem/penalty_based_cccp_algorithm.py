@@ -51,7 +51,7 @@ def get_base_args():
     base_parser.add_argument("--cu_max_power_dbm", type=float, default=23, help="CU 最大发射功率 (dBm)")
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
     base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_delay", type=float, default=0.3, help="感知任务最大延迟 (s)")
+    base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
@@ -1389,6 +1389,12 @@ def resolve_active_constraint_groups(args):
     return active_groups
 
 
+def _get_iteration_schedule(args, fixed_total_iterations):
+    if fixed_total_iterations is None:
+        return int(args.max_iterations), int(args.max_iterations)
+    return 1, int(fixed_total_iterations)
+
+
 def _fusion_extract_matrix_level(var, dim):
     return np.asarray(var.level(), dtype=float).reshape(dim, dim)
 
@@ -1640,7 +1646,9 @@ def penalty_based_cccp_fusion(args,
                               uavs_targets_matched_matrix, uavs_cus_matched_matrix,
                               uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power,
                               use_penalty_rank1=True,
-                              cus_entertaining_task_size=None):
+                              cus_entertaining_task_size=None,
+                              fixed_total_iterations=None,
+                              disable_early_stop=False):
     """
     基于惩罚的 CCCP 算法求解器，使用 MOSEK Fusion 作为子问题求解器
     """
@@ -1723,9 +1731,11 @@ def penalty_based_cccp_fusion(args,
     rank1_val_list = []
     cur_original_obj_fun_val = float('inf')
 
-    for outer_iter in range(args.max_iterations):
+    outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
+
+    for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
-        for inner_iter in range(args.max_iterations):
+        for inner_iter in range(inner_iterations):
             print(f"-------------------- 第 {iter_count + 1} 次迭代，rho = {cur_penalty_factor.value:.4e} --------------------")
             fusion_result = solve_inner_problem_with_fusion(
                 args=args,
@@ -1825,7 +1835,7 @@ def penalty_based_cccp_fusion(args,
                 first_iter_rank_boost_lb.value = 0.0
 
             obj_fun_opt = cur_original_obj_fun_val
-            if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
+            if (not disable_early_stop) and inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
                 print(f" Convergency!!! - 第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
                 print(f" Convergency!!! - 第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
                 break
@@ -1841,7 +1851,7 @@ def penalty_based_cccp_fusion(args,
                                                        static_constraint_data,
                                                        c44_const_terms, c44_grad_mats,
                                                        c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
-        if rank1_gap_max < args.rank1_threshold:
+        if (not disable_early_stop) and rank1_gap_max < args.rank1_threshold:
             break
         cur_penalty_factor.value *= args.zoom_factor
         update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
@@ -1857,7 +1867,9 @@ def penalty_based_cccp(args,
                        uavs_targets_matched_matrix, uavs_cus_matched_matrix,
                        uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power,
                        use_penalty_rank1 = True,
-                       cus_entertaining_task_size = None
+                       cus_entertaining_task_size = None,
+                       fixed_total_iterations = None,
+                       disable_early_stop = False
                        ):
     """
     基于惩罚的 CCCP 算法
@@ -1889,7 +1901,9 @@ def penalty_based_cccp(args,
             uavs_off_duration=uavs_off_duration,
             cus_off_power=cus_off_power,
             use_penalty_rank1=use_penalty_rank1,
-            cus_entertaining_task_size=cus_entertaining_task_size
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            fixed_total_iterations=fixed_total_iterations,
+            disable_early_stop=disable_early_stop
         )
 
     if cus_entertaining_task_size is None:
@@ -2037,9 +2051,10 @@ def penalty_based_cccp(args,
     energy_val_list = []
     rank1_val_list = []
     cur_original_obj_fun_val = float('inf')
-    for outer_iter in range(args.max_iterations):
+    outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
+    for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
-        for inner_iter in range(args.max_iterations):
+        for inner_iter in range(inner_iterations):
             print(f"-------------------- 第 {iter_count + 1} 轮, rho = {cur_penalty_factor.value:.4e} --------------------")
             problem.solve(solver=cp.MOSEK, warm_start=True, canon_backend="COO", verbose=False)
             print("compilation_time =", problem.compilation_time)
@@ -2104,7 +2119,7 @@ def penalty_based_cccp(args,
                 first_iter_rank_boost_lb.value = 0.0
 
             obj_fun_opt = cur_original_obj_fun_val
-            if inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
+            if (not disable_early_stop) and inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
                 print(f" Convergency!!! - 第 {iter_count} 轮求解的问题的 VALUE 值:", cur_original_obj_fun_val)
                 print(f" Convergency!!! - 第 {iter_count} 轮rank1 gap 总和:", cur_rank1_sum)
                 break
@@ -2142,7 +2157,7 @@ def penalty_based_cccp(args,
                     rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
                     rank1_const_terms=rank1_const_terms,
                 )
-        if rank1_gap_max < args.rank1_threshold:
+        if (not disable_early_stop) and rank1_gap_max < args.rank1_threshold:
             break
         cur_penalty_factor.value *= args.zoom_factor
         update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
@@ -2151,6 +2166,61 @@ def penalty_based_cccp(args,
                                               rank1_const_terms)
 
     return obj_fun_opt, iter_count, energy_val_list, rank1_val_list
+
+
+def generate_rho_sweep_energy_csv(args,
+                                  uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
+                                  uavs_targets_matched_matrix, uavs_cus_matched_matrix,
+                                  uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power,
+                                  use_penalty_rank1=True,
+                                  cus_entertaining_task_size=None,
+                                  rho_values=None,
+                                  fixed_total_iterations=30,
+                                  csv_prefix=None):
+    """
+    固定迭代 fixed_total_iterations 次，比较不同 rho 对能耗收敛曲线的影响，并导出 energy CSV。
+    该函数不会触发提前收敛判断，也不会修改传入 args 的原始内容。
+    """
+    if rho_values is None:
+        rho_values = [0.001, 0.01, 0.1, 1, 10, 100]
+    if csv_prefix is None:
+        csv_prefix = date_str
+    if cus_entertaining_task_size is None:
+        cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    output_paths = []
+
+    for rho in rho_values:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.penalty_factor = rho
+        run_args.enable_cccp_diagnostics = False
+
+        _, _, energy_val_list, _ = penalty_based_cccp(
+            args=run_args,
+            uavs_2_cus_channels=uavs_2_cus_channels,
+            uavs_2_bs_channels=uavs_2_bs_channels,
+            cus_2_bs_channels=cus_2_bs_channels,
+            uavs_2_targets_channels=uavs_2_targets_channels,
+            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+            uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            use_penalty_rank1=use_penalty_rank1,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            fixed_total_iterations=fixed_total_iterations,
+            disable_early_stop=True,
+        )
+
+        output_path = os.path.join(base_dir, f"{csv_prefix}_energy_val_list_rho{rho}.csv")
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(energy_val_list)
+        output_paths.append(output_path)
+
+    return output_paths
 
 
 def dbm_2_watt(dbm):
@@ -2205,32 +2275,43 @@ if __name__ == "__main__":
     cus_off_power = np.full(args.cus_num, dbm_2_watt(args.cu_max_power_dbm) / 5)
     cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
     
-    rho_list = [1]
+    # energy_opt, _, energy_val_list, rank1_val_list = penalty_based_cccp(
+    #     args=args,
+    #     uavs_2_cus_channels=uavs_2_cus_channels,
+    #     uavs_2_bs_channels=uavs_2_bs_channels,
+    #     cus_2_bs_channels=cus_2_bs_channels,
+    #     uavs_2_targets_channels=uavs_2_targets_channels,
+    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+    #     uavs_pos_pre=uavs_pos,
+    #     uavs_pos_cur=uavs_pos_cur,
+    #     uavs_off_duration=uavs_off_duration,
+    #     cus_off_power=cus_off_power,
+    #     use_penalty_rank1=True,
+    #     cus_entertaining_task_size=cus_entertaining_task_size
+    # )
+    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(energy_val_list)
+    # with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_val_list)
 
-    for rho in rho_list:
-        args.penalty_factor = rho
-        energy_opt, _, energy_val_list, rank1_val_list = penalty_based_cccp(
-            args=args,
-            uavs_2_cus_channels=uavs_2_cus_channels,
-            uavs_2_bs_channels=uavs_2_bs_channels,
-            cus_2_bs_channels=cus_2_bs_channels,
-            uavs_2_targets_channels=uavs_2_targets_channels,
-            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-            uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-            uavs_pos_pre=uavs_pos,
-            uavs_pos_cur=uavs_pos_cur,
-            uavs_off_duration=uavs_off_duration,
-            cus_off_power=cus_off_power,
-            use_penalty_rank1=True,
-            cus_entertaining_task_size=cus_entertaining_task_size
-        )
-        with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(energy_val_list)
-        with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(rank1_val_list)
-
+    generate_rho_sweep_energy_csv(
+        args=args,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_2_targets_channels=uavs_2_targets_channels,
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_pos_pre=uavs_pos,
+        uavs_pos_cur=uavs_pos_cur,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+        use_penalty_rank1=True,
+        cus_entertaining_task_size=cus_entertaining_task_size,
+    )
 
     # print("======================================== 分界线 ========================================")
     # print("======================================== 分界线 ========================================")
