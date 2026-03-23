@@ -48,7 +48,7 @@ class MyEnv(gym.Env):
                                     cus_pos = self.init_cus_pos,
                                     ref_path_loss = db_2_watt(base_args.ref_path_loss_db),  # 1m 下参考路径损耗
                                     frac_d_lambda = base_args.frac_d_lambda,  # 天线间距为半波长
-                                    alphaction_uav_link = base_args.alphaction_uav_link,  # 与 UAV 有关链路的路径损耗系数
+                                    alpha_uav_link = base_args.alpha_uav_link,  # 与 UAV 有关链路的路径损耗系数
                                     alpha_cu_link = base_args.alpha_cu_link,  # 与 CU 有关的路径损耗系数
                                     rician_factor = db_2_watt(base_args.rician_factor_db),  # Rician 因子
                                     antenna_nums = base_args.antenna_nums  # UAV 天线数量
@@ -70,7 +70,7 @@ class MyEnv(gym.Env):
             = self.match_uav_targets_nearest(uavs_pos = self.init_uavs_pos,
                                     targets_pos = self.init_targets_pos
                                     )
-        # 重要：更新掩码，标记这些目标在未来时隙不再可用 [事实]
+        # 更新掩码，标记这些目标在未来时隙不再可用
         matched_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
         self.target_sensed_mask[matched_indices] = True
         # -------- 初始化信道矩阵 --------
@@ -203,11 +203,11 @@ class MyEnv(gym.Env):
                                                                                   uavs_2_targets_channels = self.uavs_2_targets_channels,
                                                                                   uavs_targets_matched_matrix = self.uavs_targets_matched_matrix,
                                                                                   uavs_cus_matched_matrix = uavs_cus_matched_matrix,
-                                                                                  uavs_pos_pre = self.cur_uav_pos,
-                                                                                  next_uavs_pos = next_uavs_pos,
+                                                                                  uavs_pos = self.cur_uav_pos,
+                                                                                  uavs_pos_cur = next_uavs_pos,
                                                                                   uavs_off_duration = off_duration,
                                                                                   cus_off_power = cus_off_power)
-
+        print(f"Episode {i_episode}, Time Slot {self.t}: Total Reward = {total_reward:.4f}, Energy Opt = {energy_opt:.4f}")
         # 下一状态更新
         self.t += 1  # 时隙 index 增加 1
         self.cur_uavs_pos = next_uavs_pos  # 更新UAV位置
@@ -218,7 +218,7 @@ class MyEnv(gym.Env):
                                 cus_pos = self.cur_cus_pos,
                                 ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db),  # 1m 下参考路径损耗
                                 frac_d_lambda = self.base_args.frac_d_lambda,  # 天线间距为半波长
-                                alphaction_uav_link = self.base_args.alphaction_uav_link,  # 与 UAV 有关链路的路径损耗系数
+                                alpha_uav_link = self.base_args.alpha_uav_link,  # 与 UAV 有关链路的路径损耗系数
                                 alpha_cu_link = self.base_args.alpha_cu_link,  # 与 CU 有关的路径损耗系数
                                 rician_factor = db_2_watt(self.base_args.rician_factor_db),  # Rician 因子
                                 antenna_nums = self.base_args.antenna_nums  # UAV 天线数量
@@ -293,7 +293,7 @@ class MyEnv(gym.Env):
                                    cus_pos = self.cur_cus_pos,
                                    ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db),  # 1m 下参考路径损耗
                                    frac_d_lambda = self.base_args.frac_d_lambda,  # 天线间距为半波长
-                                   alphaction_uav_link = self.base_args.alphaction_uav_link,  # 与 UAV 有关链路的路径损耗系数
+                                   alpha_uav_link = self.base_args.alpha_uav_link,  # 与 UAV 有关链路的路径损耗系数
                                    alpha_cu_link = self.base_args.alpha_cu_link,  # 与 CU 有关的路径损耗系数
                                    rician_factor = db_2_watt(self.base_args.rician_factor_db),  # Rician 因子
                                    antenna_nums = self.base_args.antenna_nums  # UAV 天线数量
@@ -343,6 +343,7 @@ class MyEnv(gym.Env):
         init_state_dict["bs"] = bs_obs
 
         return init_state_dict  # reward, done, info can't be included
+
 
     def getPosUAV(self):
         """
@@ -413,7 +414,7 @@ class MyEnv(gym.Env):
         return uavs_pos, cus_pos, targets_pos
 
 
-    def compute_com_channel_gain(self, uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, alphaction_uav_link, alpha_cu_link, rician_factor, antenna_nums):
+    def compute_com_channel_gain(self, uavs_pos, cus_pos, ref_path_loss, frac_d_lambda, alpha_uav_link, alpha_cu_link, rician_factor, antenna_nums):
         """
         UAVs, CUs 和 BS 之间的均建模为莱斯路径损耗模型
         根据莱斯路径损耗模型计算 UAVs、CUs 和 BS 之间的通信信道增益
@@ -465,10 +466,10 @@ class MyEnv(gym.Env):
             return h
 
         # UAVs -> CUs (MIMO, N antennas at UAV)
-        uavs_2_cus_channels = get_rician_channel(uavs_pos, cus_pos, alphaction_uav_link, rician_factor, is_mimo=True)
+        uavs_2_cus_channels = get_rician_channel(uavs_pos, cus_pos, alpha_uav_link, rician_factor, is_mimo=True)
         
         # UAVs -> BS (MIMO, N antennas at UAV)
-        uavs_2_bs_channels = get_rician_channel(uavs_pos, bs_pos[np.newaxis, :], alphaction_uav_link, rician_factor, is_mimo=True)
+        uavs_2_bs_channels = get_rician_channel(uavs_pos, bs_pos[np.newaxis, :], alpha_uav_link, rician_factor, is_mimo=True)
         
         # CUs -> BS (SISO, 1 antenna at CU)
         cus_2_bs_channels = get_rician_channel(cus_pos, bs_pos[np.newaxis, :], alpha_cu_link, rician_factor, is_mimo=False)
@@ -525,10 +526,10 @@ class MyEnv(gym.Env):
         num_targets = targets_pos.shape[0]
         uavs_targets_matched_matrix = np.zeros((num_uavs, num_targets))
         
-        # 1. 找到尚未被感知的目标索引 [推断: 保证不重复感知]
+        # 1. 找到尚未被感知的目标索引
         available_indices = np.where(~self.target_sensed_mask)[0]
         
-        # 健壮性检查：如果剩余目标不足，则 fallback 到全体目标（或根据业务逻辑处理）
+        # 健壮性检查：如果剩余目标不足，则 fallback 到全体目标
         if len(available_indices) < num_uavs:
             available_indices = np.arange(num_targets)
 
@@ -553,9 +554,10 @@ class MyEnv(gym.Env):
         """
         Gauss-Markov 模型轨迹
         """
-        traj = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 3), dtype=float)
+        # NOTE - 比总的时隙多生成一个时刻，因为最后一个时刻还要获取下一个时刻的动作
+        traj = np.zeros((self.madrl_args.total_time_slots + 1, self.base_args.cus_num, 3), dtype=float)
         # 使用二维向量表示速度，因为用户在地面移动
-        velocities = np.zeros((self.madrl_args.total_time_slots, self.base_args.cus_num, 2), dtype=float)
+        velocities = np.zeros((self.madrl_args.total_time_slots + 1, self.base_args.cus_num, 2), dtype=float)
 
         # 初始化起始位置和速度
         if self.init_cus_pos.shape[0] > 0:
@@ -570,7 +572,7 @@ class MyEnv(gym.Env):
         rng = np.random.default_rng(self.base_args.seed)
 
         # 循环为所有时间片生成轨迹
-        for t in range(self.madrl_args.total_time_slots - 1):
+        for t in range(self.madrl_args.total_time_slots):
             # 为所有用户生成随机分量
             # 对应于 Gauss-Markov 模型中的随机过程 w_k[n]
             random_component = rng.normal(size=(self.base_args.cus_num, 2))

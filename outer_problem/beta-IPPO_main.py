@@ -45,6 +45,7 @@ def get_tensorboard_writer(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     return SummaryWriter(log_dir=log_dir)
 
+
 def db_2_watt(db):
     """
     将 dB 转换为瓦特
@@ -52,6 +53,7 @@ def db_2_watt(db):
     :return: 功率值（瓦特）
     """
     return 10 ** (db / 10)
+
 
 def get_madrl_args():
     madrl_parser = argparse.ArgumentParser(description="MADRL 超参数")
@@ -73,21 +75,21 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=8, help="目标数量")
+    base_parser.add_argument("--targets_num", type=int, default=240, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=8, help="UAV 数量")
-    base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
+    base_parser.add_argument("--cus_num", type=int, default=16, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
-    base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
+    base_parser.add_argument("--radius", type=float, default=1000, help="区域半径 (m)")
     base_parser.add_argument("--center", type=float, default=[0, 0], help="区域中心坐标 (m)") 
 
     # 信道参数
     base_parser.add_argument("--ref_path_loss_db", type=float, default=-30, help="1m 参考路径损耗 (dB)")
     base_parser.add_argument("--frac_d_lambda", type=float, default=0.5, help="天线间距与波长比例")
-    base_parser.add_argument("--alphaction_uav_link", type=float, default=2, help="UAV 链路路径损耗指数")
+    base_parser.add_argument("--alpha_uav_link", type=float, default=2, help="UAV 链路路径损耗指数")
     base_parser.add_argument("--alpha_cu_link", type=float, default=2.5, help="CU 链路路径损耗指数")
     base_parser.add_argument("--rician_factor_db", type=float, default=10, help="Rician 因子 (dB)")
-    base_parser.add_argument("--antenna_nums", type=int, default=8, help="UAV 天线数量")
-    base_parser.add_argument("--radar_rcs", type=float, default=10, help="雷达 RCS (m^2)")
+    base_parser.add_argument("--antenna_nums", type=int, default=6, help="UAV 天线数量")
+    base_parser.add_argument("--radar_rcs", type=float, default=10, help="雷达 RCS (mm^2)")
     base_parser.add_argument("--noise_power_density_dbm", type=float, default=-174, help="噪声功率谱密度 (dBm/Hz)")
     base_parser.add_argument("--bandwidth", type=float, default=10e6, help="带宽 (Hz)")
 
@@ -95,18 +97,20 @@ def get_base_args():
     base_parser.add_argument("--uav_c1", type=float, default=0.00614, help="UAV 飞行参数 c1")
     base_parser.add_argument("--uav_c2", type=float, default=15.976, help="UAV 飞行参数 c2")
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
-    base_parser.add_argument("--bs_max_freq", type=float, default=20e9, help="BS 最大工作频率 (Hz)")
+    base_parser.add_argument("--bs_max_freq", type=float, default=10e9, help="BS 最大工作频率 (Hz)")
+    base_parser.add_argument("--freq_scale", type=float, default=1e9, help="频率归一化尺度")
+    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  # 20260321 - 修改了 obj5
     base_parser.add_argument("--bs_cycles_per_bit", type=float, default=1000, help="BS 处理 1bit 需要的周期数")
-    base_parser.add_argument("--time_slot_duration", type=float, default=0.5, help="时隙长度 (s)")
+    base_parser.add_argument("--time_slot_duration", type=float, default=0.6, help="时隙长度 (s)")
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
     base_parser.add_argument("--cu_max_power_dbm", type=float, default=23, help="CU 最大发射功率 (dBm)")
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
-    base_parser.add_argument("--cu_max_delay", type=float, default=0.5, help="娱乐任务最大延迟 (s)")
+    base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
-    base_parser.add_argument("--sen_sinr", type=float, default=2, help="感知门限阈值 (dB)")
+    base_parser.add_argument("--sen_sinr", type=float, default=20, help="感知门限阈值 (dB)")
     base_parser.add_argument("--markov_velocity", type=float, default=[1, 0, 0], help="马尔可夫模型初始速度 (m/s)")
     base_parser.add_argument("--markov_memory_level", type=float, default=0.4, help="马尔可夫模型记忆水平")
     base_parser.add_argument("--markov_asymptotic_mean_of_velocity", type=float, default=[1, 0, 0], help="马尔可夫模型渐进平均值")
@@ -124,13 +128,25 @@ def get_base_args():
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
 
     # 基于惩罚的 CCCP 算法参数
-    base_parser.add_argument("--max_iterations", type=int, default=30, help="CCCP 算法最大迭代次数")
-    base_parser.add_argument("--cccp_threshold", type=float, default=1e-5, help="CCCP 算法收敛阈值")
-    base_parser.add_argument("--penalty_factor", type=float, default=1e-1, help="罚因子")
-    base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
-    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32, 4.39,4.40, 4.44, 4.45, auxiliary_t", help="启用约束组，逗号分隔")
+    base_parser.add_argument("--max_iterations", type=int, default=5, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--cccp_threshold", type=float, default=1e-3, help="CCCP 算法目标函数收敛阈值")
+    base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
+    base_parser.add_argument("--penalty_factor", type=float, default=0.1, help="罚因子")
+    base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
+    base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
+    base_parser.add_argument("--diagnostic_violation_tol", type=float, default=1e-7, help="CCCP 诊断时的违约容差")
+    base_parser.add_argument("--diagnostic_top_k", type=int, default=5, help="CCCP 诊断时打印的最大违约约束组数量")
+    base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-8, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=True,
+                             help="开关参数")
+    base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
+                             help="强度参数")
+    base_parser.add_argument("--solver_backend", type=str, default="fusion", choices=["fusion", "cvxpy"],
+                             help="是否采用 Fusion 求解器，默认为 True（使用 Mosek Fusion），否则使用 CVXPY（默认使用 Mosek 作为 CVXPY 的求解器）")
+    
     return base_parser.parse_args()
     
 
@@ -274,8 +290,8 @@ if __name__ == "__main__":
                 r_bs = np.mean(r_dict["bs"]) if np.ndim(r_dict["bs"]) > 0 and len(r_dict["bs"]) > 0 else float(r_dict["bs"])
 
                 # 奖励归一化
-                r_uav_norm = [reward_scalers_uav[j](r_uav_list[j]) for j in range(base_args.uavs_num)]
-                r_bs_norm = reward_scaler_bs(r_bs)
+                r_uav_norm = [np.asarray(reward_scalers_uav[j](r_uav_list[j])).item() for j in range(base_args.uavs_num)]
+                r_bs_norm = np.asarray(reward_scaler_bs(r_bs)).item()
 
                 # 累计各agent奖励
                 episode_rewards_total.append(total_reward)
