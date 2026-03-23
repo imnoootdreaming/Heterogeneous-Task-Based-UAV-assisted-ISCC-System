@@ -9,6 +9,7 @@ from matplotlib.ticker import MaxNLocator
 import warnings
 from datetime import datetime  # 新增
 import csv  # 新增：用于将迭代数据写入 CSV 文件
+from gaussian_based_cccp_algorithm import gaussian_based_cccp, save_and_plot_gaussian_cccp_history
 from scipy.optimize import linear_sum_assignment  # 引入线性求和分配函数
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings('error', category=RuntimeWarning)  # 把 RuntimeWarning 当作异常处理
@@ -72,8 +73,8 @@ def get_base_args():
     base_parser.add_argument("--max_iterations", type=int, default=5, help="CCCP 算法最大迭代次数")
     base_parser.add_argument("--cccp_threshold", type=float, default=1e-6, help="CCCP 算法目标函数收敛阈值")
     base_parser.add_argument("--rank1_threshold", type=float, default=1e-6, help="CCCP 算法秩一约束收敛阈值")
-    base_parser.add_argument("--penalty_factor", type=float, default=1, help="罚因子")
-    base_parser.add_argument("--zoom_factor", type=float, default=1.5, help="缩放系数")
+    base_parser.add_argument("--penalty_factor", type=float, default=0.1, help="罚因子")
+    base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
     base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
     base_parser.add_argument("--diagnostic_violation_tol", type=float, default=1e-7, help="CCCP 诊断时的违约容差")
     base_parser.add_argument("--diagnostic_top_k", type=int, default=5, help="CCCP 诊断时打印的最大违约约束组数量")
@@ -1653,7 +1654,7 @@ def penalty_based_cccp_fusion(args,
     基于惩罚的 CCCP 算法求解器，使用 MOSEK Fusion 作为子问题求解器
     """
     if cus_entertaining_task_size is None:
-        cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+        cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
 
     matched_uav_sensing_channel = extract_matched_sensing_channel(
         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
@@ -1829,7 +1830,7 @@ def penalty_based_cccp_fusion(args,
             print(f"第 {iter_count} 轮 最大rank1 gap:", rank1_gap_max)
             print(f"第 {iter_count} 轮 总rank1 gap:", cur_rank1_sum)
             energy_val_list.append(cur_pure_energy_val)
-            rank1_val_list.append(cur_rank1_sum)
+            rank1_val_list.append(rank1_gap_max)
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -1907,7 +1908,7 @@ def penalty_based_cccp(args,
         )
 
     if cus_entertaining_task_size is None:
-        cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+        cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
     # 根据匹配矩阵提取对应的信道响应矩阵
     # 结果维度: (I, N, N)，其中 I 是 UAV 数量，N 是天线数量
@@ -2113,7 +2114,7 @@ def penalty_based_cccp(args,
             print(f"第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
             print(f"第 {iter_count} 轮 rank1 gap 总和:", cur_rank1_sum)
             energy_val_list.append(cur_pure_energy_val)
-            rank1_val_list.append(cur_rank1_sum)
+            rank1_val_list.append(rank1_gap_max)
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -2186,7 +2187,7 @@ def generate_rho_sweep_energy_csv(args,
     if csv_prefix is None:
         csv_prefix = date_str
     if cus_entertaining_task_size is None:
-        cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+        cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     output_paths = []
@@ -2214,7 +2215,7 @@ def generate_rho_sweep_energy_csv(args,
             disable_early_stop=True,
         )
 
-        output_path = os.path.join(base_dir, f"{csv_prefix}_energy_val_list_rho{rho}.csv")
+        output_path = os.path.join(base_dir, f"{csv_prefix}_compare_energy_val_list_rho{rho}.csv")
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(energy_val_list)
@@ -2273,8 +2274,10 @@ if __name__ == "__main__":
     # 固定 DRL 侧输入
     uavs_off_duration = np.full(args.uavs_num, (args.uav_max_delay - args.uav_sen_duration) * 0.8)
     cus_off_power = np.full(args.cus_num, dbm_2_watt(args.cu_max_power_dbm) / 5)
-    cus_entertaining_task_size = np.random.uniform(4e3, 8e3, args.cus_num)
+    cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
+
+    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
     # energy_opt, _, energy_val_list, rank1_val_list = penalty_based_cccp(
     #     args=args,
     #     uavs_2_cus_channels=uavs_2_cus_channels,
@@ -2297,8 +2300,25 @@ if __name__ == "__main__":
     #     writer = csv.writer(f)
     #     writer.writerow(rank1_val_list)
 
-    generate_rho_sweep_energy_csv(
-        args=args,
+    # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
+    # generate_rho_sweep_energy_csv(
+    #     args=args,
+    #     uavs_2_cus_channels=uavs_2_cus_channels,
+    #     uavs_2_bs_channels=uavs_2_bs_channels,
+    #     cus_2_bs_channels=cus_2_bs_channels,
+    #     uavs_2_targets_channels=uavs_2_targets_channels,
+    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+    #     uavs_pos_pre=uavs_pos,
+    #     uavs_pos_cur=uavs_pos_cur,
+    #     uavs_off_duration=uavs_off_duration,
+    #     cus_off_power=cus_off_power,
+    #     use_penalty_rank1=True,
+    #     cus_entertaining_task_size=cus_entertaining_task_size,
+    # )
+
+    # NOTE - 绘图3 - Gaussian-based CCCP 的能耗和 rank1 gap 收敛曲线
+    obj_opt, iter_count, energy_val_list, rank1_val_list = gaussian_based_cccp(args=args,
         uavs_2_cus_channels=uavs_2_cus_channels,
         uavs_2_bs_channels=uavs_2_bs_channels,
         cus_2_bs_channels=cus_2_bs_channels,
@@ -2309,24 +2329,6 @@ if __name__ == "__main__":
         uavs_pos_cur=uavs_pos_cur,
         uavs_off_duration=uavs_off_duration,
         cus_off_power=cus_off_power,
-        use_penalty_rank1=True,
-        cus_entertaining_task_size=cus_entertaining_task_size,
+        cus_entertaining_task_size=cus_entertaining_task_size
     )
-
-    # print("======================================== 分界线 ========================================")
-    # print("======================================== 分界线 ========================================")
-    # print("======================================== 分界线 ========================================")
-    # # 采用基于高斯随机化的 CCCP 算法计算出最优的能耗和迭代次数
-    # gaussian_based_energy_opt, iter_count = gaussian_randomized_based_cccp(args = args,
-    #                                             uavs_2_cus_channels = uavs_2_cus_channels,
-    #                                             uavs_2_bs_channels = uavs_2_bs_channels,
-    #                                             cus_2_bs_channels = cus_2_bs_channels,
-    #                                             uavs_2_targets_channels = uavs_2_targets_channels,
-    #                                             uavs_targets_matched_matrix = uavs_targets_matched_matrix,
-    #                                             uavs_cus_matched_matrix = uavs_cus_matched_matrix,
-    #                                             uavs_pos_pre = uavs_pos,
-    #                                             uavs_pos_cur = uavs_pos_cur,
-    #                                             uavs_off_duration = uavs_off_duration,
-    #                                             cus_off_power = cus_off_power,
-    #                                             use_penalty_rank1 = True,
-    #                                             cus_entertaining_task_size = cus_entertaining_task_size)
+    save_and_plot_gaussian_cccp_history(energy_val_list, rank1_val_list)
