@@ -18,7 +18,7 @@ rank1_values = np.atleast_1d(np.loadtxt(rank1_path, delimiter=","))
 iters_energy = np.arange(1, energy_values.size + 1)
 iters_rank1 = np.arange(1, rank1_values.size + 1)
 
-fig, ax1 = plt.subplots(figsize=(12, 8))
+fig, ax1 = plt.subplots(figsize=(10, 8))
 ax2 = ax1.twinx()
 
 line1 = ax1.plot(

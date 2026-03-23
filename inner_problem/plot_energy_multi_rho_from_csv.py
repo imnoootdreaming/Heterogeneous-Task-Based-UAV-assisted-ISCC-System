@@ -40,13 +40,15 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     series = load_energy_series(base_dir)
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(10, 8))
 
     markers = ["s", "o", "^", "D", "v", "P"]
     linestyles = ["-", "--", "-.", ":"]
 
     for idx, (rho, values) in enumerate(series):
         iterations = np.arange(1, values.size + 1)
+        # 判断是否为整数（如 10.0），若是则转为整数显示
+        rho_display = int(rho) if rho.is_integer() else rho
         ax.plot(
             iterations,
             values,
@@ -56,7 +58,7 @@ def main():
             linewidth=2,
             markerfacecolor="white",
             markeredgewidth=1.5,
-            label=fr"$\rho = {rho}$"
+            label=fr"$\rho = {rho_display}$"
         )
 
     ax.set_xlabel("The number of iterations", fontsize=24)
