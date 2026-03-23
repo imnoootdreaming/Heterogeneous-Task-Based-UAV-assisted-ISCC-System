@@ -9,7 +9,7 @@ from matplotlib.ticker import MaxNLocator
 import warnings
 from datetime import datetime  # 新增
 import csv  # 新增：用于将迭代数据写入 CSV 文件
-from gaussian_based_cccp_algorithm import gaussian_based_cccp, save_and_plot_gaussian_cccp_history
+# from gaussian_based_cccp_algorithm import gaussian_based_cccp, save_and_plot_gaussian_cccp_history
 from scipy.optimize import linear_sum_assignment  # 引入线性求和分配函数
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings('error', category=RuntimeWarning)  # 把 RuntimeWarning 当作异常处理
@@ -778,6 +778,36 @@ def compute_pure_energy_value(args, cur_uavs_sen_beams, cur_uavs_off_beams, cur_
     )
 
 
+def compute_per_uav_total_energy_list(args, cur_uavs_sen_beams, cur_uavs_off_beams, cur_bs_2_uav_freqs_norm, cur_auxiliary_variable_z,
+                                      uavs_off_duration, uavs_pos_pre, uavs_pos_cur):
+    """
+    璁＄畻姣忎釜 UAV 鐨勬€昏兘鑰楋紙浠呭寘鍚?UAV 鐩稿叧鐨?4 閮ㄥ垎锛夈€?
+    """
+    omega_weight_1 = args.omega_weight_1
+    omega_weight_2 = args.omega_weight_2
+    kappa = args.kappa
+    uavs_pos_cur = np.array(uavs_pos_cur, dtype=float)
+    uavs_pos_pre = np.array(uavs_pos_pre, dtype=float)
+    uav_dist_diff = np.linalg.norm(uavs_pos_cur - uavs_pos_pre, axis=1)
+    uav_dist_diff = np.maximum(uav_dist_diff, 1e-8)
+    uav_fly_energy = ((args.uav_c1 * (uav_dist_diff ** 3) / (args.time_slot_duration ** 2)) +
+                      (args.uav_c2 * (args.time_slot_duration ** 2) / uav_dist_diff))
+
+    per_uav_energy_list = []
+    for i in range(args.uavs_num):
+        f_ui = cur_bs_2_uav_freqs_norm[i] * args.freq_scale
+        per_uav_energy = (
+            omega_weight_1 * kappa * args.bs_cycles_per_bit * args.uav_sen_duration
+            * (args.z_scale * cur_auxiliary_variable_z[i]) * (f_ui ** 2)
+            + omega_weight_2 * args.uav_sen_duration * np.real(np.trace(cur_uavs_sen_beams[i]))
+            + omega_weight_2 * uavs_off_duration[i] * np.real(np.trace(cur_uavs_off_beams[i]))
+            + omega_weight_2 * uav_fly_energy[i]
+        )
+        per_uav_energy_list.append(float(np.real(per_uav_energy)))
+
+    return per_uav_energy_list
+
+
 def compute_original_obj5_value(args, cur_bs_2_uav_freqs_norm, cur_auxiliary_variable_z):
     alpha = args.omega_weight_1 * args.kappa * args.bs_cycles_per_bit * args.uav_sen_duration
     z_val = np.asarray(cur_auxiliary_variable_z, dtype=float) * args.z_scale  # 20260321 - 修改了 obj5
@@ -1400,6 +1430,25 @@ def _fusion_extract_matrix_level(var, dim):
     return np.asarray(var.level(), dtype=float).reshape(dim, dim)
 
 
+def _build_fusion_failure_result(build_time, solve_time, num_iters, problem_status, solution_status, error_message):
+    return {
+        "failed": True,
+        "status": solution_status,
+        "problem_status": problem_status,
+        "objective_value": float("inf"),
+        "uavs_sen_beams": None,
+        "uavs_off_beams": None,
+        "bs_2_uav_freqs_norm": None,
+        "auxiliary_variable_z": None,
+        "cus_off_duration": None,
+        "t": None,
+        "build_time": float(build_time),
+        "solve_time": float(solve_time),
+        "num_iters": int(num_iters),
+        "error_message": error_message,
+    }
+
+
 def solve_inner_problem_with_fusion(args, active_groups, static_constraint_data,
                                     hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
                                     hat_uav_sen_beams, hat_uav_off_beams,
@@ -1622,23 +1671,52 @@ def solve_inner_problem_with_fusion(args, active_groups, static_constraint_data,
 
         problem_status = str(model.getProblemStatus())
         solution_status = str(model.getPrimalSolutionStatus())
+        problem_status_lower = problem_status.lower()
+        solution_status_lower = solution_status.lower()
 
-        sen_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(W_vars[i], lifted_dim)) for i in range(I)]
-        off_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(B_vars[i], lifted_dim)) for i in range(I)]
+        if "unknown" in problem_status_lower or "unknown" in solution_status_lower:
+            return _build_fusion_failure_result(
+                build_time=build_time,
+                solve_time=solve_time,
+                num_iters=num_iters,
+                problem_status=problem_status,
+                solution_status=solution_status,
+                error_message="Fusion solver did not return an accessible optimal solution.",
+            )
+
+        try:
+            sen_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(W_vars[i], lifted_dim)) for i in range(I)]
+            off_beams = [real_lift_to_complex_matrix(_fusion_extract_matrix_level(B_vars[i], lifted_dim)) for i in range(I)]
+            objective_value = float(model.primalObjValue())
+            bs_2_uav_freqs_norm = np.asarray(f_var.level(), dtype=float)
+            auxiliary_variable_z = np.asarray(z_var.level(), dtype=float)
+            cus_off_duration = np.asarray(d_var.level(), dtype=float)
+            t_level = np.asarray(t_var.level(), dtype=float)
+        except Exception as exc:
+            return _build_fusion_failure_result(
+                build_time=build_time,
+                solve_time=solve_time,
+                num_iters=num_iters,
+                problem_status=problem_status,
+                solution_status=solution_status,
+                error_message=str(exc),
+            )
 
         return {
+            "failed": False,
             "status": solution_status,
             "problem_status": problem_status,
-            "objective_value": float(model.primalObjValue()),
+            "objective_value": objective_value,
             "uavs_sen_beams": sen_beams,
             "uavs_off_beams": off_beams,
-            "bs_2_uav_freqs_norm": np.asarray(f_var.level(), dtype=float),
-            "auxiliary_variable_z": np.asarray(z_var.level(), dtype=float),
-            "cus_off_duration": np.asarray(d_var.level(), dtype=float),
-            "t": np.asarray(t_var.level(), dtype=float),
+            "bs_2_uav_freqs_norm": bs_2_uav_freqs_norm,
+            "auxiliary_variable_z": auxiliary_variable_z,
+            "cus_off_duration": cus_off_duration,
+            "t": t_level,
             "build_time": float(build_time),
             "solve_time": float(solve_time),
             "num_iters": num_iters,
+            "error_message": "",
         }
 
 
@@ -1720,16 +1798,17 @@ def penalty_based_cccp_fusion(args,
                                                c44_const_terms, c44_grad_mats,
                                                c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
 
-    print("-------------------------------------------------------- ")
-    print(f"-------------------- CCCP求解开始-------------------- ")
-    print("-------------------------------------------------------- ")
-    print("Fusion backend is enabled. CCCP diagnostics based on CVXPY violation() are skipped.")
+    # print("-------------------------------------------------------- ")
+    # print(f"-------------------- CCCP求解开始-------------------- ")
+    # print("-------------------------------------------------------- ")
+    # print("Fusion backend is enabled. CCCP diagnostics based on CVXPY violation() are skipped.")
 
     iter_count = 0
     obj_fun_opt = float('inf')
     rank1_gap_max = float('inf')
     energy_val_list = []
     rank1_val_list = []
+    per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
 
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
@@ -1737,7 +1816,7 @@ def penalty_based_cccp_fusion(args,
     for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
         for inner_iter in range(inner_iterations):
-            print(f"-------------------- 第 {iter_count + 1} 次迭代，rho = {cur_penalty_factor.value:.4e} --------------------")
+            # print(f"-------------------- 第 {iter_count + 1} 次迭代，rho = {cur_penalty_factor.value:.4e} --------------------")
             fusion_result = solve_inner_problem_with_fusion(
                 args=args,
                 active_groups=active_groups,
@@ -1769,10 +1848,17 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_cur=uavs_pos_cur,
                 use_penalty_rank1=use_penalty_rank1,
             )
-            print("compilation_time =", fusion_result["build_time"])
-            print("solve_time =", fusion_result["solve_time"])
-            print("num_iters =", fusion_result["num_iters"])
+            # print("compilation_time =", fusion_result["build_time"])
+            # print("solve_time =", fusion_result["solve_time"])
+            # print("num_iters =", fusion_result["num_iters"])
             iter_count += 1
+
+            if fusion_result.get("failed", False):
+                per_uav_energy_list = [float("inf")] * args.uavs_num
+                energy_val_list.append(float("inf"))
+                rank1_val_list.append(float("inf"))
+                # print("内层问题不可解")
+                return float("inf"), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
 
             cur_surrogate_opt_val = float(np.real(fusion_result["objective_value"]))
             cur_uavs_sen_beams = fusion_result["uavs_sen_beams"]
@@ -1809,16 +1895,26 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_pre=uavs_pos_pre,
                 uavs_pos_cur=uavs_pos_cur
             )
-            print(f"第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
-            print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
-            print(f"第 {iter_count} 轮 原始目标函数值", cur_original_obj_fun_val)
-            print(f"第 {iter_count} 轮 不包含罚函数的目标函数值", cur_pure_energy_val)
+            # print(f"第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
+            # print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+            # print(f"第 {iter_count} 轮 原始目标函数值", cur_original_obj_fun_val)
+            # print(f"第 {iter_count} 轮 不包含罚函数的目标函数值", cur_pure_energy_val)
 
             for i in range(args.uavs_num):
                 hat_uav_sen_beams[i].value = cur_uavs_sen_beams[i]
                 hat_uav_off_beams[i].value = cur_uavs_off_beams[i]
             hat_auxiliary_variable_z.value = cur_auxiliary_variable_z
             hat_bs_2_uav_freqs_norm.value = cur_bs_2_uav_freqs_norm
+            per_uav_energy_list = compute_per_uav_total_energy_list(
+                args=args,
+                cur_uavs_sen_beams=cur_uavs_sen_beams,
+                cur_uavs_off_beams=cur_uavs_off_beams,
+                cur_bs_2_uav_freqs_norm=cur_bs_2_uav_freqs_norm,
+                cur_auxiliary_variable_z=cur_auxiliary_variable_z,
+                uavs_off_duration=uavs_off_duration,
+                uavs_pos_pre=uavs_pos_pre,
+                uavs_pos_cur=uavs_pos_cur
+            )
 
             rank1_gap_max = 0.0
             cur_rank1_sum = 0.0
@@ -1827,8 +1923,8 @@ def penalty_based_cccp_fusion(args,
                 b_gap = np.real(np.trace(cur_uavs_off_beams[i])) - np.linalg.norm(cur_uavs_off_beams[i], 2)
                 cur_rank1_sum += w_gap + b_gap
                 rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
-            print(f"第 {iter_count} 轮 最大rank1 gap:", rank1_gap_max)
-            print(f"第 {iter_count} 轮 总rank1 gap:", cur_rank1_sum)
+            # print(f"第 {iter_count} 轮 最大rank1 gap:", rank1_gap_max)
+            # print(f"第 {iter_count} 轮 总rank1 gap:", cur_rank1_sum)
             energy_val_list.append(cur_pure_energy_val)
             rank1_val_list.append(rank1_gap_max)
 
@@ -1837,8 +1933,8 @@ def penalty_based_cccp_fusion(args,
 
             obj_fun_opt = cur_original_obj_fun_val
             if (not disable_early_stop) and inner_iter != 0 and (abs(cur_original_obj_fun_val - pre_original_obj_fun_val) / abs(pre_original_obj_fun_val)) < args.cccp_threshold:
-                print(f" Convergency!!! - 第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
-                print(f" Convergency!!! - 第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+                # print(f" Convergency!!! - 第 {iter_count} 轮 Fusion求解器求解状态: {fusion_result['status']}")
+                # print(f" Convergency!!! - 第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
                 break
             pre_original_obj_fun_val = cur_original_obj_fun_val
 
@@ -1860,7 +1956,7 @@ def penalty_based_cccp_fusion(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list
+    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
 
 
 def penalty_based_cccp(args,
@@ -1886,7 +1982,11 @@ def penalty_based_cccp(args,
     :param uavs_pos_cur: UAVs 当前时刻位置 (维度: I * 3) (DRL 输出)
     :param uavs_off_duration: UAVs 感知任务卸载时长 (维度: I) (DRL 输出)
     :param cus_off_power: CUs 娱乐任务卸载功率 (维度: J) (DRL 输出)
-    :return: 目标函数总延迟
+    :param use_penalty_rank1: 是否在目标函数中使用基于核范数的 rank-1 惩罚项
+    :param cus_entertaining_task_size: CUs 娱乐任务大小 (维度: J)，如果为 None 则在指定范围内随机生成
+    :param fixed_total_iterations: 固定的总迭代次数，如果为 None 则使用默认的迭代调度策略
+    :param disable_early_stop: 是否禁用基于目标函数值变化率的早停机制
+    :return obj_fun_opt: 最优目标函数值
     """
     if str(args.solver_backend).lower() == "fusion":
         return penalty_based_cccp_fusion(
@@ -2051,6 +2151,7 @@ def penalty_based_cccp(args,
     rank1_gap_max = float('inf')
     energy_val_list = []
     rank1_val_list = []
+    per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
     for outer_iter in range(outer_iterations):
@@ -2065,7 +2166,7 @@ def penalty_based_cccp(args,
             cur_surrogate_opt_val = float(np.real(problem.objective.value))
             if problem.status in ("infeasible", "infeasible_inaccurate"):
                 print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
-                return float('inf'), iter_count
+                return float('inf'), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
             elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
                 cur_original_obj_fun_val = compute_original_obj_fun_value(
                     args=args,
@@ -2104,6 +2205,16 @@ def penalty_based_cccp(args,
                 hat_uav_off_beams[i].value = var_uavs_off_beam[i].value
             hat_auxiliary_variable_z.value = var_auxiliary_variable_z.value
             hat_bs_2_uav_freqs_norm.value = var_bs_2_uav_freqs_norm.value
+            per_uav_energy_list = compute_per_uav_total_energy_list(
+                args=args,
+                cur_uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
+                cur_uavs_off_beams=[v.value for v in var_uavs_off_beam],
+                cur_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
+                cur_auxiliary_variable_z=var_auxiliary_variable_z.value,
+                uavs_off_duration=uavs_off_duration,
+                uavs_pos_pre=uavs_pos_pre,
+                uavs_pos_cur=uavs_pos_cur
+            )
             rank1_gap_max = 0.0
             cur_rank1_sum = 0.0
             for i in range(args.uavs_num):
@@ -2166,7 +2277,7 @@ def penalty_based_cccp(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list
+    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
 
 
 def generate_rho_sweep_energy_csv(args,
@@ -2197,7 +2308,7 @@ def generate_rho_sweep_energy_csv(args,
         run_args.penalty_factor = rho
         run_args.enable_cccp_diagnostics = False
 
-        _, _, energy_val_list, _ = penalty_based_cccp(
+        _, _, energy_val_list, _, _ = penalty_based_cccp(
             args=run_args,
             uavs_2_cus_channels=uavs_2_cus_channels,
             uavs_2_bs_channels=uavs_2_bs_channels,
@@ -2278,27 +2389,27 @@ if __name__ == "__main__":
     
 
     # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    # energy_opt, _, energy_val_list, rank1_val_list = penalty_based_cccp(
-    #     args=args,
-    #     uavs_2_cus_channels=uavs_2_cus_channels,
-    #     uavs_2_bs_channels=uavs_2_bs_channels,
-    #     cus_2_bs_channels=cus_2_bs_channels,
-    #     uavs_2_targets_channels=uavs_2_targets_channels,
-    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-    #     uavs_pos_pre=uavs_pos,
-    #     uavs_pos_cur=uavs_pos_cur,
-    #     uavs_off_duration=uavs_off_duration,
-    #     cus_off_power=cus_off_power,
-    #     use_penalty_rank1=True,
-    #     cus_entertaining_task_size=cus_entertaining_task_size
-    # )
-    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(energy_val_list)
-    # with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(rank1_val_list)
+    energy_opt, _, energy_val_list, rank1_val_list, per_uav_energy_list = penalty_based_cccp(
+        args=args,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_2_targets_channels=uavs_2_targets_channels,
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_pos_pre=uavs_pos,
+        uavs_pos_cur=uavs_pos_cur,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+        use_penalty_rank1=True,
+        cus_entertaining_task_size=cus_entertaining_task_size
+    )
+    with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(energy_val_list)
+    with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(rank1_val_list)
 
     # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
     # generate_rho_sweep_energy_csv(
@@ -2317,18 +2428,18 @@ if __name__ == "__main__":
     #     cus_entertaining_task_size=cus_entertaining_task_size,
     # )
 
-    # NOTE - 绘图3 - Gaussian-based CCCP 的能耗和 rank1 gap 收敛曲线
-    obj_opt, iter_count, energy_val_list, rank1_val_list = gaussian_based_cccp(args=args,
-        uavs_2_cus_channels=uavs_2_cus_channels,
-        uavs_2_bs_channels=uavs_2_bs_channels,
-        cus_2_bs_channels=cus_2_bs_channels,
-        uavs_2_targets_channels=uavs_2_targets_channels,
-        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-        uavs_pos_pre=uavs_pos,
-        uavs_pos_cur=uavs_pos_cur,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        cus_entertaining_task_size=cus_entertaining_task_size
-    )
-    save_and_plot_gaussian_cccp_history(energy_val_list, rank1_val_list)
+    # # NOTE - 绘图3 - Gaussian-based CCCP 的能耗和 rank1 gap 收敛曲线
+    # obj_opt, iter_count, energy_val_list, rank1_val_list = gaussian_based_cccp(args=args,
+    #     uavs_2_cus_channels=uavs_2_cus_channels,
+    #     uavs_2_bs_channels=uavs_2_bs_channels,
+    #     cus_2_bs_channels=cus_2_bs_channels,
+    #     uavs_2_targets_channels=uavs_2_targets_channels,
+    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+    #     uavs_pos_pre=uavs_pos,
+    #     uavs_pos_cur=uavs_pos_cur,
+    #     uavs_off_duration=uavs_off_duration,
+    #     cus_off_power=cus_off_power,
+    #     cus_entertaining_task_size=cus_entertaining_task_size
+    # )
+    # save_and_plot_gaussian_cccp_history(energy_val_list, rank1_val_list)
