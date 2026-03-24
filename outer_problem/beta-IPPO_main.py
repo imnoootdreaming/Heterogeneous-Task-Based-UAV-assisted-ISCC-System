@@ -75,11 +75,11 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=240, help="目标数量")
-    base_parser.add_argument("--uavs_num", type=int, default=8, help="UAV 数量")
-    base_parser.add_argument("--cus_num", type=int, default=16, help="CU 数量")
+    base_parser.add_argument("--targets_num", type=int, default=30, help="目标数量")
+    base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
+    base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
-    base_parser.add_argument("--radius", type=float, default=1000, help="区域半径 (m)")
+    base_parser.add_argument("--radius", type=float, default=600, help="区域半径 (m)")
     base_parser.add_argument("--center", type=float, default=[0, 0], help="区域中心坐标 (m)") 
 
     # 信道参数
@@ -151,8 +151,6 @@ def get_base_args():
     
 
 if __name__ == "__main__":
-    setSeed(seed = 42)  # 设置全局唯一种子 保证仿真可复现
-    
     # 2026-03-16: Fixed f-string format for python compatibility if needed
     current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     writer = get_tensorboard_writer(log_dir = f"runs/beta-ippo/{current_time_str}_beta-ippo_result")  # 利用 tensorboard 可视化训练结果
@@ -162,6 +160,7 @@ if __name__ == "__main__":
 
     base_args = get_base_args()  # 获取系统环境参数
     madrl_args = get_madrl_args()  # 获取 MADRL 参数
+    setSeed(seed = base_args.seed)  # 设置全局唯一种子 保证仿真可复现
 
     # 创建环境
     env = MyEnv(base_args = base_args, madrl_args = madrl_args) 
@@ -330,11 +329,11 @@ if __name__ == "__main__":
             if np.mean(episode_rewards_total) > max_avg_reward:
                 max_avg_reward = np.mean(episode_rewards_total)
                 if len(uav_positions_episode) > 0:
-                    best_uav_trajectory = np.array(uav_positions_episode)  # shape: (50, uav_num, 3)
+                    best_uav_trajectory = np.array(uav_positions_episode, copy=True)  # shape: (time_slots, uav_num, 3)
                 if len(cu_positions_episode) > 0:
-                    cu_trajectory = np.array(cu_positions_episode)
+                    cu_trajectory = np.array(cu_positions_episode, copy=True)
                 if len(target_positions_episode) > 0:
-                    target_trajectory = np.array(target_positions_episode) # 2026-03-16: Store target trajectory
+                    target_trajectory = np.array(target_positions_episode, copy=True) # 2026-03-16: Store target trajectory
 
             # ---  更新所有 UAV Agents ---
             for uav_i in range(base_args.uavs_num):

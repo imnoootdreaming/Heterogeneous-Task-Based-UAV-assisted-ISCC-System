@@ -30,8 +30,10 @@ class MyEnv(gym.Env):
     def __init__(self, base_args, madrl_args):
         super(MyEnv, self).__init__()
         # 获取仿真参数设定
+        self.t = 0  # 初始时隙为 0 
         self.base_args = base_args
         self.madrl_args = madrl_args
+        self.cus_entertaining_task_size = np.ones(self.base_args.cus_num) * 170e3  # 每个 CU 的娱乐任务大小 (bits)
         # -------- 初始化位置 --------
         self.init_uavs_pos, self.init_cus_pos, self.init_targets_pos = self.generate_pos(self.base_args.uavs_num, self.base_args.cus_num, self.base_args.targets_num, self.base_args.center, self.base_args.radius, self.base_args.uav_height)
         self.cur_uavs_pos = self.init_uavs_pos  # 初始的 UAV 位置
@@ -65,14 +67,12 @@ class MyEnv(gym.Env):
                                     ref_path_loss = db_2_watt(base_args.ref_path_loss_db)  # 1m 下参考路径损耗
                                     )  # 计算感知信道响应矩阵
         
-        self.target_sensed_mask = np.zeros(self.base_args.targets_num, dtype=bool)
-        self.uavs_targets_matched_matrix \
-            = self.match_uav_targets_nearest(uavs_pos = self.init_uavs_pos,
-                                    targets_pos = self.init_targets_pos
-                                    )
-        # 更新掩码，标记这些目标在未来时隙不再可用
-        matched_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
-        self.target_sensed_mask[matched_indices] = True
+        # 20260324 - 修改 UAV 感知目标对象：预生成每个时隙每个 UAV 的感知目标，
+        # 并直接构造当前时隙的 UAV-target 匹配矩阵，替代动态最近匹配。
+        self.precomputed_uav_target_schedule = self.generate_uav_target_schedule()
+        self.uavs_targets_matched_matrix = self.build_uav_targets_matched_matrix(
+            self.precomputed_uav_target_schedule[self.t]
+        )
         # -------- 初始化信道矩阵 --------
         
         # -------- 定义动作空间 --------
@@ -120,7 +120,9 @@ class MyEnv(gym.Env):
         # 1. UAV i 的坐标
         # 2. UAV <==> BS 的信道 (real + imag 实部 + 虚部)
         # 3. UAV <==> 感知的 TARGET 的信道 (real + imag 实部 + 虚部)
-        obs_dim_uav = 3 + self.base_args.antenna_nums * 2 + self.base_args.antenna_nums * self.base_args.antenna_nums * 2
+        # 20260324 - 修改 UAV 感知目标对象：为 UAV observation 显式加入目标坐标 3 维。
+        obs_dim_uav = 6 + self.base_args.antenna_nums * 2 + self.base_args.antenna_nums * self.base_args.antenna_nums * 2
+        obs_dim_uav = 6 + self.base_args.antenna_nums * 2 + self.base_args.antenna_nums * self.base_args.antenna_nums * 2
         self.observation_space["uav"] = {
             f"uav_{i}": spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -160,6 +162,7 @@ class MyEnv(gym.Env):
                 action["bs"] = ...
             i_episode: 当前 episode 索引 (optional)
         """
+
         uav_actions_dict = actions["uav"]
         diff_thetas = []
         diff_distances = []
@@ -193,9 +196,11 @@ class MyEnv(gym.Env):
             uavs_cus_matched_matrix[i, cu_idx] = 1
 
         # next_uavs_pos 根据动作生成
-        next_uavs_pos = self.cur_uav_pos + np.stack([diff_distance * np.cos(diff_theta),
+        next_uavs_pos = self.cur_uavs_pos + np.stack([diff_distance * np.cos(diff_theta),
                                                     diff_distance * np.sin(diff_theta),
                                                     np.zeros_like(diff_distance * np.cos(diff_theta))], axis=1)
+        
+        
 
         total_reward, reward, energy_opt = self.reward_calculator.reward_compute(uavs_2_cus_channels = self.uavs_2_cus_channels,
                                                                                   uavs_2_bs_channels = self.uavs_2_bs_channels,
@@ -203,10 +208,12 @@ class MyEnv(gym.Env):
                                                                                   uavs_2_targets_channels = self.uavs_2_targets_channels,
                                                                                   uavs_targets_matched_matrix = self.uavs_targets_matched_matrix,
                                                                                   uavs_cus_matched_matrix = uavs_cus_matched_matrix,
-                                                                                  uavs_pos = self.cur_uav_pos,
+                                                                                  uavs_pos = self.cur_uavs_pos,
                                                                                   uavs_pos_cur = next_uavs_pos,
                                                                                   uavs_off_duration = off_duration,
-                                                                                  cus_off_power = cus_off_power)
+                                                                                  cus_off_power = cus_off_power,
+                                                                                  cus_entertaining_task_size = self.cus_entertaining_task_size
+                                                                                  )
         print(f"Episode {i_episode}, Time Slot {self.t}: Total Reward = {total_reward:.4f}, Energy Opt = {energy_opt:.4f}")
         # 下一状态更新
         self.t += 1  # 时隙 index 增加 1
@@ -235,13 +242,10 @@ class MyEnv(gym.Env):
                                     ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db)  # 1m 下参考路径损耗 
                                     )  # 计算感知信道响应矩阵
 
-        self.uavs_targets_matched_matrix \
-            = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
-                                    targets_pos = self.init_targets_pos
-                                    )
-        # 重要：更新掩码，标记这些目标在未来时隙不再可用 [事实]
-        matched_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
-        self.target_sensed_mask[matched_indices] = True
+        # 20260324 - 修改 UAV 感知目标对象：下一时隙的 UAV-target 匹配矩阵
+        self.uavs_targets_matched_matrix = self.build_uav_targets_matched_matrix(
+            self.precomputed_uav_target_schedule[self.t]
+        )
 
         next_state_dict = {"uav": {}, "bs": None}
 
@@ -251,10 +255,14 @@ class MyEnv(gym.Env):
             uavs_2_cus_channels_i = self.uavs_2_cus_channels[i]
             uavs_2_bs_channels_i = self.uavs_2_bs_channels[i]
             # 根据索引选择 UAV 此时感知的 TARGET
-            target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
+            target_idx = int(self.precomputed_uav_target_schedule[self.t, i])
+            # 20260324 - 修改 UAV 感知目标对象：next_state 中显式加入当前时隙的目标坐标。
+            target_coord = self.init_targets_pos[target_idx]
+            target_coord = self.init_targets_pos[target_idx]
             uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
             uav_obs = np.concatenate([
                                     uav_coord.astype(np.float32),
+                                    target_coord.astype(np.float32),
                                     uavs_2_bs_channels_i.real.flatten(),
                                     uavs_2_bs_channels_i.imag.flatten(),
                                     uavs_2_targets_channels_i.real.flatten(),
@@ -280,16 +288,14 @@ class MyEnv(gym.Env):
     def reset(self):
         self.t = 0  # 时隙初始化
         # 初始化到最初状态
-        # init_cur_uav_pos: 初始 UAV 坐标
+        # init_cur_uavs_pos: 初始 UAV 坐标
         # init_user_pos: 初始化用户坐标
-        self.target_sensed_mask = np.zeros(self.base_args.targets_num, dtype=bool)
-        # 恢复初始 UAV 和用户位置
-        self.cur_uav_pos = self.init_uavs_pos.copy()
+        self.cur_uavs_pos = self.init_uavs_pos.copy()
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()  # 读取轨迹的初始点
         
         # 初始化信道
         self.uavs_2_cus_channels, self.uavs_2_bs_channels, self.cus_2_bs_channels \
-            = self.compute_com_channel_gain(uavs_pos = self.cur_uav_pos,
+            = self.compute_com_channel_gain(uavs_pos = self.cur_uavs_pos,
                                    cus_pos = self.cur_cus_pos,
                                    ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db),  # 1m 下参考路径损耗
                                    frac_d_lambda = self.base_args.frac_d_lambda,  # 天线间距为半波长
@@ -306,29 +312,30 @@ class MyEnv(gym.Env):
                                     antenna_nums = self.base_args.antenna_nums,  # UAV 天线数量
                                     ref_path_loss = db_2_watt(self.base_args.ref_path_loss_db)  # 1m 下参考路径损耗 
                                     )  # 计算感知信道响应矩阵
+        # 初始化 UAV <==> TARGET 匹配矩阵
+        self.uavs_targets_matched_matrix = self.build_uav_targets_matched_matrix(
+            self.precomputed_uav_target_schedule[self.t]
+        )
 
-        self.uavs_targets_matched_matrix \
-            = self.match_uav_targets_nearest(uavs_pos = self.cur_uavs_pos,
-                                    targets_pos = self.init_targets_pos
-                                    )
-        # 找到本次匹配的目标索引并标记为已感知
-        matched_target_indices = np.argmax(self.uavs_targets_matched_matrix, axis=1)
-        self.target_sensed_mask[matched_target_indices] = True
         # 初始化观测空间 init_state_dict
         # UAV 观测空间
         # 1. UAV i 的坐标
-        # 2. CU <==> UAV 信道
+        # 2. TARGET <==> UAV 信道
         # 3. UAV <==> BS 的信道
+        # TODO - 删除 TARGET <==> UAV 信道
         init_state_dict = {"uav": {}, "bs": None}
         for i in range(self.base_args.uavs_num):
             uav_coord = self.init_uavs_pos[i]
-            uavs_2_cus_channels_i = self.uavs_2_cus_channels[i]
             uavs_2_bs_channels_i = self.uavs_2_bs_channels[i]
             # 根据匹配矩阵选择对应的目标通道
-            target_idx = np.argmax(self.uavs_targets_matched_matrix[i])
+            target_idx = int(self.precomputed_uav_target_schedule[self.t, i])
+            # 20260324 - 修改 UAV 感知目标对象：reset 初始状态中显式加入当前时隙的目标坐标。
+            target_coord = self.init_targets_pos[target_idx]
             uavs_2_targets_channels_i = self.uavs_2_targets_channels[i, target_idx]  # 选择对应的通道
+            target_coord = self.init_targets_pos[target_idx]
             uav_obs = np.concatenate([
                                     uav_coord.astype(np.float32),
+                                    target_coord.astype(np.float32),
                                     uavs_2_bs_channels_i.real.flatten(),
                                     uavs_2_bs_channels_i.imag.flatten(),
                                     uavs_2_targets_channels_i.real.flatten(),
@@ -349,31 +356,49 @@ class MyEnv(gym.Env):
         """
         获取当前时隙 UAV 坐标
         """
-        if self.t < self.cur_uavs_pos.shape[0]:
-            return self.cur_uavs_pos[self.t]
-        return self.cur_uavs_pos[-1]
+        return self.cur_uavs_pos.copy()
 
 
     def getPosCU(self):
         """
         获取当前时隙 CU 坐标
         """
-        if self.t < self.cur_cus_pos.shape[0]:
-             return self.cur_cus_pos[self.t]
-        return self.cur_cus_pos[-1]
+        # cur_cus_pos stores all CUs at the current time slot.
+        return self.cur_cus_pos.copy()
 
 
     def getPosTarget(self):
         """
         获取当前时隙 Target 坐标
         """
-        # Targets might be stationary or moving. Assuming they are stored in targets_pos
-        # If targets are stationary, they might just be repeated or single frame.
-        # Based on generate_pos, targets_pos is (T, N, 3) or (N, 3) initially.
-        # Assuming similar structure to uavs_pos.
-        if self.t < self.init_targets_pos.shape[0]:
-             return self.init_targets_pos[self.t]
-        return self.init_targets_pos[-1]
+        return self.init_targets_pos.copy()
+
+
+    def generate_uav_target_schedule(self):
+        total_slots = self.madrl_args.total_time_slots + 1
+        schedule = np.zeros((total_slots, self.base_args.uavs_num), dtype=np.int64)
+        for t in range(total_slots):
+            if self.base_args.targets_num >= self.base_args.uavs_num:
+                schedule[t] = np.random.permutation(self.base_args.targets_num)[:self.base_args.uavs_num]
+            else:
+                schedule[t] = np.random.choice(
+                    self.base_args.targets_num,
+                    size=self.base_args.uavs_num,
+                    replace=True
+                )
+        return schedule
+
+
+    def build_uav_targets_matched_matrix(self, target_indices):
+        matched_matrix = np.zeros((self.base_args.uavs_num, self.base_args.targets_num), dtype=np.float32)
+        clipped_target_indices = np.clip(
+            np.asarray(target_indices, dtype=np.int64),
+            0,
+            self.base_args.targets_num - 1
+        )
+        for i, target_idx in enumerate(clipped_target_indices):
+            matched_matrix[i, target_idx] = 1.0
+        return matched_matrix
 
 
     def generate_pos(self, uavs_num, cus_num, targets_num, center, radius, uav_height):
@@ -521,35 +546,6 @@ class MyEnv(gym.Env):
         return uavs_2_targets_channels
 
 
-    def match_uav_targets_nearest(self, uavs_pos, targets_pos):
-        num_uavs = uavs_pos.shape[0]
-        num_targets = targets_pos.shape[0]
-        uavs_targets_matched_matrix = np.zeros((num_uavs, num_targets))
-        
-        # 1. 找到尚未被感知的目标索引
-        available_indices = np.where(~self.target_sensed_mask)[0]
-        
-        # 健壮性检查：如果剩余目标不足，则 fallback 到全体目标
-        if len(available_indices) < num_uavs:
-            available_indices = np.arange(num_targets)
-
-        # 2. 仅计算 UAV 与 “可用目标” 之间的距离矩阵
-        # diff shape: (num_uavs, len(available_indices), 3)
-        diff = uavs_pos[:, np.newaxis, :] - targets_pos[available_indices][np.newaxis, :, :]
-        dist_matrix = np.linalg.norm(diff, axis=2)
-        
-        # 3. 匈牙利算法求解最小距离匹配
-        row_ind, col_ind = linear_sum_assignment(dist_matrix)
-        
-        # 4. 将子矩阵的列索引映射回原始 targets_pos 的全局索引
-        actual_target_indices = available_indices[col_ind]
-        
-        # 设置匹配矩阵
-        uavs_targets_matched_matrix[row_ind, actual_target_indices] = 1
-        
-        return uavs_targets_matched_matrix
-
-
     def generate_cu_trajectory(self):
         """
         Gauss-Markov 模型轨迹
@@ -561,7 +557,8 @@ class MyEnv(gym.Env):
 
         # 初始化起始位置和速度
         if self.init_cus_pos.shape[0] > 0:
-            traj[0] = self.init_cus_pos[0].copy()
+            # Preserve each CU's own initial position at t=0.
+            traj[0] = self.init_cus_pos.copy()
         
         # Fix: markov_velocity is list, need to convert or use directly if numpy handled
         # Assuming base_args.markov_velocity is list like [1, 0, 0]

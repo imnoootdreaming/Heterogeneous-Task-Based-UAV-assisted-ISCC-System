@@ -289,6 +289,7 @@ class IPPO:
                 surr1 = ratio * adv[index]  # 修改: surrogate-1 改为 mini-batch 对齐
                 surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * adv[index]  # 修改: surrogate-2 改为 mini-batch 对齐
                 actor_loss = torch.mean(-torch.min(surr1, surr2))  # 修改: actor 损失在 mini-batch 上求均值
+                # actor_loss = torch.mean(-torch.min(surr1, surr2)) - self.entropy_coef * dist_entropy.mean()  # 修改: 加入 mini-batch 平均熵奖励
 
                 critic_loss = F.mse_loss(self.critic(states[index]), v_target[index].detach())  # 修改: critic 损失改为 mini-batch 对齐
 

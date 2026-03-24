@@ -13,28 +13,28 @@ import numpy as np
 class MyReward:
     def __init__(self, base_args):
         self.base_args = base_args
-        self.x_max = 1000
-        self.y_max = 1000
+        self.x_max = 600
+        self.y_max = 600
         pass
 
     def reward_compute(self, uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels, 
                        uavs_targets_matched_matrix, uavs_cus_matched_matrix, 
-                       uavs_pos, uavs_pos_cur, uavs_off_duration, cus_off_power):
+                       uavs_pos, uavs_pos_cur, uavs_off_duration, cus_off_power, cus_entertaining_task_size):
         uav_collision_penalty = np.zeros(self.base_args.uavs_num)  # 每个 UAV 的碰撞惩罚
         uav_exceed_boundary_penalty = np.zeros(self.base_args.uavs_num)  # 每个 UAV 的越界惩罚
         reward = {"uav": [0.0] * self.base_args.uavs_num, "bs": 0.0}
 
         # UAV 边界检查
         for i in range(self.base_args.uavs_num):
-            x, y, z = uavs_pos[i]
+            x, y, z = uavs_pos_cur[i]
             if x < -self.x_max or x > self.x_max or y < -self.y_max or y > self.y_max:
                 uav_exceed_boundary_penalty[i] = 1
                 # 拉回边界
-                uavs_pos[i][0] = np.clip(x, -self.x_max, self.x_max)
-                uavs_pos[i][1] = np.clip(y, -self.y_max, self.y_max)    
+                uavs_pos_cur[i][0] = np.clip(x, -self.x_max, self.x_max)
+                uavs_pos_cur[i][1] = np.clip(y, -self.y_max, self.y_max)    
             # UAV 碰撞检测
             for j in range(i + 1, self.base_args.uavs_num):
-                dist = np.linalg.norm(uavs_pos[i] - uavs_pos[j])
+                dist = np.linalg.norm(uavs_pos_cur[i] - uavs_pos_cur[j])
                 if dist < self.base_args.uav_safe_distance:  # 小于安全距离判定为碰撞或过近
                     uav_collision_penalty[i] = 1
                     uav_collision_penalty[j] = 1
@@ -55,7 +55,8 @@ class MyReward:
                                         uavs_pos_pre = uavs_pos,
                                         uavs_pos_cur = uavs_pos_cur,
                                         uavs_off_duration = uavs_off_duration,
-                                        cus_off_power = cus_off_power)
+                                        cus_off_power = cus_off_power,
+                                        cus_entertaining_task_size = cus_entertaining_task_size)
                                                                         
         total_reward_4_energy = np.exp(-energy_opt / 10)  # 对奖励函数进行缩放
         for i in range(self.base_args.uavs_num):
