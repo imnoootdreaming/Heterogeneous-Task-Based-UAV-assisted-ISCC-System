@@ -23,8 +23,8 @@ def get_base_args():
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
     base_parser.add_argument("--targets_num", type=int, default=8, help="目标数量")
-    base_parser.add_argument("--uavs_num", type=int, default=8, help="UAV 数量")
-    base_parser.add_argument("--cus_num", type=int, default=16, help="CU 数量")
+    base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
+    base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
     base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
 
@@ -2388,31 +2388,8 @@ if __name__ == "__main__":
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
 
-    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    energy_opt, _, energy_val_list, rank1_val_list, per_uav_energy_list = penalty_based_cccp(
-        args=args,
-        uavs_2_cus_channels=uavs_2_cus_channels,
-        uavs_2_bs_channels=uavs_2_bs_channels,
-        cus_2_bs_channels=cus_2_bs_channels,
-        uavs_2_targets_channels=uavs_2_targets_channels,
-        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-        uavs_pos_pre=uavs_pos,
-        uavs_pos_cur=uavs_pos_cur,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        use_penalty_rank1=True,
-        cus_entertaining_task_size=cus_entertaining_task_size
-    )
-    with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(energy_val_list)
-    with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(rank1_val_list)
-
-    # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
-    # generate_rho_sweep_energy_csv(
+    # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
+    # energy_opt, _, energy_val_list, rank1_val_list, per_uav_energy_list = penalty_based_cccp(
     #     args=args,
     #     uavs_2_cus_channels=uavs_2_cus_channels,
     #     uavs_2_bs_channels=uavs_2_bs_channels,
@@ -2425,21 +2402,28 @@ if __name__ == "__main__":
     #     uavs_off_duration=uavs_off_duration,
     #     cus_off_power=cus_off_power,
     #     use_penalty_rank1=True,
-    #     cus_entertaining_task_size=cus_entertaining_task_size,
-    # )
-
-    # # NOTE - 绘图3 - Gaussian-based CCCP 的能耗和 rank1 gap 收敛曲线
-    # obj_opt, iter_count, energy_val_list, rank1_val_list = gaussian_based_cccp(args=args,
-    #     uavs_2_cus_channels=uavs_2_cus_channels,
-    #     uavs_2_bs_channels=uavs_2_bs_channels,
-    #     cus_2_bs_channels=cus_2_bs_channels,
-    #     uavs_2_targets_channels=uavs_2_targets_channels,
-    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-    #     uavs_pos_pre=uavs_pos,
-    #     uavs_pos_cur=uavs_pos_cur,
-    #     uavs_off_duration=uavs_off_duration,
-    #     cus_off_power=cus_off_power,
     #     cus_entertaining_task_size=cus_entertaining_task_size
     # )
-    # save_and_plot_gaussian_cccp_history(energy_val_list, rank1_val_list)
+    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(energy_val_list)
+    # with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_val_list)
+
+    # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
+    generate_rho_sweep_energy_csv(
+        args=args,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_2_targets_channels=uavs_2_targets_channels,
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_pos_pre=uavs_pos,
+        uavs_pos_cur=uavs_pos_cur,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+        use_penalty_rank1=True,
+        cus_entertaining_task_size=cus_entertaining_task_size,
+    )
