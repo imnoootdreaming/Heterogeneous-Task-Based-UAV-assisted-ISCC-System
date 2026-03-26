@@ -81,8 +81,8 @@ def get_base_args():
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
-    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-12, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
-    base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=True,
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-16, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=False,
                              help="开关参数")
     base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
                              help="强度参数")
@@ -420,18 +420,37 @@ def initialize_uav_beams(args, matched_uav_sensing_channel, uavs_2_bs_channels):
     hat_uav_sen_beams = []
     hat_uav_off_beams = []
     full_rank_init = (args.uav_max_power / args.antenna_nums) * np.eye(args.antenna_nums, dtype=complex)
+    sen_rank1_mix_ratio = 0.002
+    off_rank1_mix_ratio = 0.01
+
+    def normalize_direction(vector):
+        vector = np.asarray(vector, dtype=complex).reshape(-1)
+        norm_val = np.linalg.norm(vector)
+        if norm_val <= 1e-12:
+            fallback = np.zeros(args.antenna_nums, dtype=complex)
+            fallback[0] = 1.0
+            return fallback
+        return vector / norm_val
+
+    def build_rank1_dominant_init(direction, mix_ratio):
+        direction = normalize_direction(direction)
+        rank1_init = args.uav_max_power * np.outer(direction, np.conj(direction))
+        beam_init = (1.0 - mix_ratio) * rank1_init + mix_ratio * full_rank_init
+        return (beam_init + beam_init.conj().T) / 2
 
     # ==============================
     # 初始化 UAV 感知波束
     # ==============================
     for i in range(args.uavs_num):
-        hat_uav_sen_beams.append(full_rank_init.copy())
+        sen_vec = compute_largest_eigenvector(matched_uav_sensing_channel[i])
+        hat_uav_sen_beams.append(build_rank1_dominant_init(sen_vec, sen_rank1_mix_ratio))
 
     # ==============================
     # 初始化 UAV 卸载感知任务波束
     # ==============================
     for i in range(args.uavs_num):
-        hat_uav_off_beams.append(full_rank_init.copy())
+        off_vec = uavs_2_bs_channels[i, 0, :]
+        hat_uav_off_beams.append(build_rank1_dominant_init(off_vec, off_rank1_mix_ratio))
 
     return hat_uav_sen_beams, hat_uav_off_beams
 
@@ -1452,12 +1471,21 @@ def _build_fusion_failure_result(build_time, solve_time, num_iters, problem_stat
 def _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams):
     rank1_gap_max = 0.0
     rank1_gap_sum = 0.0
+    rank1_sen_gap_sum = 0.0
+    rank1_off_gap_sum = 0.0
     for sen_beam, off_beam in zip(cur_uavs_sen_beams, cur_uavs_off_beams):
         w_gap = np.real(np.trace(sen_beam)) - np.linalg.norm(sen_beam, 2)
         b_gap = np.real(np.trace(off_beam)) - np.linalg.norm(off_beam, 2)
+        rank1_sen_gap_sum += w_gap
+        rank1_off_gap_sum += b_gap
         rank1_gap_sum += w_gap + b_gap
         rank1_gap_max = max(rank1_gap_max, float(max(w_gap, b_gap)))
-    return float(rank1_gap_max), float(rank1_gap_sum)
+    return (
+        float(rank1_gap_max),
+        float(rank1_gap_sum),
+        float(rank1_sen_gap_sum),
+        float(rank1_off_gap_sum),
+    )
 
 
 def _solve_penalty_problem_with_fusion(args, active_groups, static_constraint_data,
@@ -1926,8 +1954,10 @@ def penalty_based_cccp_fusion(args,
     iter_count = 0
     obj_fun_opt = float('inf')
     rank1_gap_max = float('inf')
+    original_obj_val_list = []
     energy_val_list = []
-    rank1_val_list = []
+    rank1_sen_val_list = []
+    rank1_off_val_list = []
     per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
 
@@ -1966,9 +1996,11 @@ def penalty_based_cccp_fusion(args,
     )
     if init_problem_result.get("failed", False):
         per_uav_energy_list = [float("inf")] * args.uavs_num
+        original_obj_val_list.append(float("inf"))
         energy_val_list.append(float("inf"))
-        rank1_val_list.append(float("inf"))
-        return float("inf"), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+        rank1_sen_val_list.append(float("inf"))
+        rank1_off_val_list.append(float("inf"))
+        return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
 
     init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
     init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
@@ -2014,14 +2046,19 @@ def penalty_based_cccp_fusion(args,
         uavs_pos_pre=uavs_pos_pre,
         uavs_pos_cur=uavs_pos_cur
     )
-    rank1_gap_max, init_rank1_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
-    print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
+    rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
+    # print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
     print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
-    print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
-    print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
-    # print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
-    energy_val_list.append(init_original_obj_fun_val)
-    rank1_val_list.append(rank1_gap_max)
+    print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
+    # print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
+    # print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
+    print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
+    print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
+    print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
+    original_obj_val_list.append(init_original_obj_fun_val)
+    energy_val_list.append(init_pure_energy_val)
+    rank1_sen_val_list.append(init_rank1_sen_sum)
+    rank1_off_val_list.append(init_rank1_off_sum)
     cur_original_obj_fun_val = init_original_obj_fun_val
     obj_fun_opt = init_original_obj_fun_val
 
@@ -2067,10 +2104,12 @@ def penalty_based_cccp_fusion(args,
 
             if fusion_result.get("failed", False):
                 per_uav_energy_list = [float("inf")] * args.uavs_num
+                original_obj_val_list.append(float("inf"))
                 energy_val_list.append(float("inf"))
-                rank1_val_list.append(float("inf"))
+                rank1_sen_val_list.append(float("inf"))
+                rank1_off_val_list.append(float("inf"))
                 # print("内层问题不可解")
-                return float("inf"), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+                return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
 
             cur_surrogate_opt_val = float(np.real(fusion_result["objective_value"]))
             cur_uavs_sen_beams = fusion_result["uavs_sen_beams"]
@@ -2107,9 +2146,10 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_pre=uavs_pos_pre,
                 uavs_pos_cur=uavs_pos_cur
             )
-            print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+            # print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
             print(f"第 {iter_count} 轮 原始目标函数值 {cur_original_obj_fun_val}")
-            print(f"第 {iter_count} 轮线性化子问题曲线 {cur_surrogate_opt_val}")
+            print(f"第 {iter_count} 轮 纯能量消耗: {cur_pure_energy_val}")
+            # print(f"第 {iter_count} 轮线性化子问题曲线 {cur_surrogate_opt_val}")
 
             for i in range(args.uavs_num):
                 hat_uav_sen_beams[i].value = cur_uavs_sen_beams[i]
@@ -2127,11 +2167,15 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_cur=uavs_pos_cur
             )
 
-            rank1_gap_max, cur_rank1_sum = _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams)
-            print(f"第 {iter_count} 轮 最大rank1 gap: {rank1_gap_max}")
-            # print(f"第 {iter_count} 轮 rank1 gap 总和: {cur_rank1_sum}")
-            energy_val_list.append(cur_original_obj_fun_val)
-            rank1_val_list.append(rank1_gap_max)
+            rank1_gap_max, cur_rank1_sum, cur_rank1_sen_sum, cur_rank1_off_sum = _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams)
+            # print(f"第 {iter_count} 轮 最大rank1 gap: {rank1_gap_max}")
+            print(f"第 {iter_count} 轮 rank1 gap 总和: {cur_rank1_sum}")
+            print(f"第 {iter_count} 轮 w_gap 总和: {cur_rank1_sen_sum}")
+            print(f"第 {iter_count} 轮 b_gap 总和: {cur_rank1_off_sum}")
+            original_obj_val_list.append(cur_original_obj_fun_val)
+            energy_val_list.append(cur_pure_energy_val)
+            rank1_sen_val_list.append(cur_rank1_sen_sum)
+            rank1_off_val_list.append(cur_rank1_off_sum)
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -2153,7 +2197,7 @@ def penalty_based_cccp_fusion(args,
                                                        static_constraint_data,
                                                        c44_const_terms, c44_grad_mats,
                                                        c45_term4_const, c45_term5_const, c45_coef_w, c45_coef_b, c45_const_w, c45_const_b)
-        if (not disable_early_stop) and rank1_gap_max < args.rank1_threshold:
+        if (not disable_early_stop) and cur_rank1_sum < args.rank1_threshold:
             break
         cur_penalty_factor.value *= args.zoom_factor
         update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
@@ -2161,7 +2205,7 @@ def penalty_based_cccp_fusion(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+    return obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
 
 
 def solve_initial_anchor_problem_with_cvxpy(args,
@@ -2392,8 +2436,10 @@ def penalty_based_cccp(args,
     problem = cp.Problem(cp.Minimize(obj_fun), constraints)
     print(f"是否定义为 DPP : {problem.is_dcp(dpp=True)}")  # 检测是否为 DPP
     rank1_gap_max = float('inf')
+    original_obj_val_list = []
     energy_val_list = []
-    rank1_val_list = []
+    rank1_sen_val_list = []
+    rank1_off_val_list = []
     per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
@@ -2415,10 +2461,12 @@ def penalty_based_cccp(args,
     )
     if init_problem_result["status"] not in ("optimal", "optimal_inaccurate"):
         print(f"Initial anchor subproblem failed with status: {init_problem_result['status']}")
+        original_obj_val_list.append(float("inf"))
         energy_val_list.append(float("inf"))
-        rank1_val_list.append(float("inf"))
+        rank1_sen_val_list.append(float("inf"))
+        rank1_off_val_list.append(float("inf"))
         per_uav_energy_list = [float("inf")] * args.uavs_num
-        return float("inf"), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+        return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
 
     init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
     init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
@@ -2464,14 +2512,18 @@ def penalty_based_cccp(args,
         uavs_pos_pre=uavs_pos_pre,
         uavs_pos_cur=uavs_pos_cur
     )
-    rank1_gap_max, init_rank1_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
+    rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
     print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
     print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
     print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
     print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
     print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
+    print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
+    print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
+    original_obj_val_list.append(init_original_obj_fun_val)
     energy_val_list.append(init_pure_energy_val)
-    rank1_val_list.append(rank1_gap_max)
+    rank1_sen_val_list.append(init_rank1_sen_sum)
+    rank1_off_val_list.append(init_rank1_off_sum)
     cur_original_obj_fun_val = init_original_obj_fun_val
     obj_fun_opt = init_original_obj_fun_val
 
@@ -2487,7 +2539,7 @@ def penalty_based_cccp(args,
             cur_surrogate_opt_val = float(np.real(problem.objective.value))
             if problem.status in ("infeasible", "infeasible_inaccurate"):
                 print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
-                return float('inf'), iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+                return float('inf'), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
             elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
                 cur_original_obj_fun_val = compute_original_obj_fun_value(
                     args=args,
@@ -2536,14 +2588,18 @@ def penalty_based_cccp(args,
                 uavs_pos_pre=uavs_pos_pre,
                 uavs_pos_cur=uavs_pos_cur
             )
-            rank1_gap_max, cur_rank1_sum = _compute_rank1_gap_metrics(
+            rank1_gap_max, cur_rank1_sum, cur_rank1_sen_sum, cur_rank1_off_sum = _compute_rank1_gap_metrics(
                 [v.value for v in var_uavs_sen_beam],
                 [v.value for v in var_uavs_off_beam]
             )
             print(f"第 {iter_count} 轮最大 rank1 gap:", rank1_gap_max)
             print(f"第 {iter_count} 轮 rank1 gap 总和:", cur_rank1_sum)
+            print(f"第 {iter_count} 轮 w_gap 总和:", cur_rank1_sen_sum)
+            print(f"第 {iter_count} 轮 b_gap 总和:", cur_rank1_off_sum)
+            original_obj_val_list.append(cur_original_obj_fun_val)
             energy_val_list.append(cur_pure_energy_val)
-            rank1_val_list.append(rank1_gap_max)
+            rank1_sen_val_list.append(cur_rank1_sen_sum)
+            rank1_off_val_list.append(cur_rank1_off_sum)
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -2587,7 +2643,7 @@ def penalty_based_cccp(args,
                     rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
                     rank1_const_terms=rank1_const_terms,
                 )
-        if (not disable_early_stop) and rank1_gap_max < args.rank1_threshold:
+        if (not disable_early_stop) and cur_rank1_sum < args.rank1_threshold:
             break
         cur_penalty_factor.value *= args.zoom_factor
         update_rank1_linearization_parameters(args, hat_uav_sen_beams, hat_uav_off_beams,
@@ -2595,7 +2651,7 @@ def penalty_based_cccp(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, energy_val_list, rank1_val_list, per_uav_energy_list
+    return obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
 
 
 def generate_rho_sweep_energy_csv(args,
@@ -2605,7 +2661,7 @@ def generate_rho_sweep_energy_csv(args,
                                   use_penalty_rank1=True,
                                   cus_entertaining_task_size=None,
                                   rho_values=None,
-                                  fixed_total_iterations=30,
+                                  fixed_total_iterations=20,
                                   csv_prefix=None):
     """
     固定执行 fixed_total_iterations 次正式 CCCP 更新，比较不同 rho 对能耗收敛曲线的影响，并导出 energy CSV。
@@ -2613,7 +2669,7 @@ def generate_rho_sweep_energy_csv(args,
     该函数不会触发提前收敛判断，也不会修改传入 args 的原始内容。
     """
     if rho_values is None:
-        rho_values = [0.001, 0.01, 0.1, 1, 10, 100]
+        rho_values = [0.01, 0.1, 1, 10, 100]
     if csv_prefix is None:
         csv_prefix = date_str
     if cus_entertaining_task_size is None:
@@ -2626,8 +2682,8 @@ def generate_rho_sweep_energy_csv(args,
         run_args = argparse.Namespace(**vars(args))
         run_args.penalty_factor = rho
         run_args.enable_cccp_diagnostics = False
-
-        _, _, energy_val_list, _, _ = penalty_based_cccp(
+        print(f"==================== 正在执行 rho = {rho} 的 CCCP 算法 ====================")
+        _, _, _, energy_val_list, _, _, _ = penalty_based_cccp(
             args=run_args,
             uavs_2_cus_channels=uavs_2_cus_channels,
             uavs_2_bs_channels=uavs_2_bs_channels,
@@ -2706,9 +2762,9 @@ if __name__ == "__main__":
     cus_off_power = np.full(args.cus_num, dbm_2_watt(args.cu_max_power_dbm) / 5)
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
-
+    
     # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    # energy_opt, _, energy_val_list, rank1_val_list, per_uav_energy_list = penalty_based_cccp(
+    # energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list = penalty_based_cccp(
     #     args=args,
     #     uavs_2_cus_channels=uavs_2_cus_channels,
     #     uavs_2_bs_channels=uavs_2_bs_channels,
@@ -2723,12 +2779,18 @@ if __name__ == "__main__":
     #     use_penalty_rank1=True,
     #     cus_entertaining_task_size=cus_entertaining_task_size,
     # )
+    # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(original_obj_val_list)
     # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
     #     writer = csv.writer(f)
     #     writer.writerow(energy_val_list)
-    # with open(f"{date_str}_rank1_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    # with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
     #     writer = csv.writer(f)
-    #     writer.writerow(rank1_val_list)
+    #     writer.writerow(rank1_sen_val_list)
+    # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_off_val_list)
 
     # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
     generate_rho_sweep_energy_csv(
