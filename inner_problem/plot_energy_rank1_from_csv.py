@@ -43,11 +43,12 @@ line2 = ax2.plot(
     marker="o",
     linestyle=":",
     markersize=8,
-    label="The rank-one penalty term of offloading beamforming",
+    label="The rank-one penalty term for offloading beamforming",
     color=RANK1_OFF_COLOR,
     linewidth=2,
     markerfacecolor="white",
     markeredgewidth=1.5,
+    clip_on=False,  
 )
 line3 = ax2.plot(
     iters_rank1_sen,
@@ -55,14 +56,15 @@ line3 = ax2.plot(
     marker="^",
     linestyle="--",
     markersize=8,
-    label="The rank-one penalty term of sensing beamforming",
+    label="The rank-one penalty term for sensing beamforming",
     color=RANK1_SEN_COLOR,
     linewidth=2,
     markerfacecolor="white",
     markeredgewidth=1.5,
+    clip_on=False,  
 )
 
-ax1.set_xlabel("The number of total iterations", fontsize=24)
+ax1.set_xlabel("The number of iterations", fontsize=24)
 ax1.set_ylabel("The objective function value of problem P6", fontsize=24, color=OBJECTIVE_COLOR)
 ax2.set_ylabel("The value of penalty terms", fontsize=24, color=RANK1_OFF_COLOR)
 ax1.spines["left"].set_color(OBJECTIVE_COLOR)
@@ -71,9 +73,7 @@ ax2.spines["right"].set_color(RANK1_OFF_COLOR)
 ax1.tick_params(axis="y", which="major", labelsize=24, colors=OBJECTIVE_COLOR)
 ax2.tick_params(axis="y", which="major", labelsize=24, colors=RANK1_OFF_COLOR)
 ax1.spines['left'].set_color(OBJECTIVE_COLOR)
-ax1.spines['left'].set_linewidth(1.6)
 ax2.spines['right'].set_color(RANK1_OFF_COLOR)
-ax2.spines['right'].set_linewidth(1.6)
 ax2.spines['left'].set_visible(False)
 ax1.spines['top'].set_color('#E0E0E0')
 ax1.spines['bottom'].set_color('#E0E0E0')
