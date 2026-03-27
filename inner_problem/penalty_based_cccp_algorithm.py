@@ -11,6 +11,7 @@ from datetime import datetime  # 新增
 import csv  # 新增：用于将迭代数据写入 CSV 文件
 # from gaussian_based_cccp_algorithm import gaussian_based_cccp, save_and_plot_gaussian_cccp_history
 from scipy.optimize import linear_sum_assignment  # 引入线性求和分配函数
+from plot_uav_sensing_beam_pattern import plot_uav_sensing_beam_patterns
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings('error', category=RuntimeWarning)  # 把 RuntimeWarning 当作异常处理
 date_str = datetime.now().strftime("%Y%m%d_%H%M%S")  # 新增
@@ -451,6 +452,36 @@ def initialize_uav_beams(args, matched_uav_sensing_channel, uavs_2_bs_channels):
     for i in range(args.uavs_num):
         off_vec = uavs_2_bs_channels[i, 0, :]
         hat_uav_off_beams.append(build_rank1_dominant_init(off_vec, off_rank1_mix_ratio))
+
+    return hat_uav_sen_beams, hat_uav_off_beams
+
+
+def initialize_uav_beams_random(args, matched_uav_sensing_channel, uavs_2_bs_channels):
+    hat_uav_sen_beams = []
+    hat_uav_off_beams = []
+    full_rank_init = (args.uav_max_power / args.antenna_nums) * np.eye(args.antenna_nums, dtype=complex)
+    sen_rank1_mix_ratio = 0.002
+    off_rank1_mix_ratio = 0.01
+
+    def sample_random_direction():
+        direction = np.random.randn(args.antenna_nums) + 1j * np.random.randn(args.antenna_nums)
+        norm_val = np.linalg.norm(direction)
+        if norm_val <= 1e-12:
+            fallback = np.zeros(args.antenna_nums, dtype=complex)
+            fallback[0] = 1.0
+            return fallback
+        return direction / norm_val
+
+    def build_rank1_dominant_init(direction, mix_ratio):
+        rank1_init = args.uav_max_power * np.outer(direction, np.conj(direction))
+        beam_init = (1.0 - mix_ratio) * rank1_init + mix_ratio * full_rank_init
+        return (beam_init + beam_init.conj().T) / 2
+
+    for _ in range(args.uavs_num):
+        hat_uav_sen_beams.append(build_rank1_dominant_init(sample_random_direction(), sen_rank1_mix_ratio))
+
+    for _ in range(args.uavs_num):
+        hat_uav_off_beams.append(build_rank1_dominant_init(sample_random_direction(), off_rank1_mix_ratio))
 
     return hat_uav_sen_beams, hat_uav_off_beams
 
@@ -1488,6 +1519,38 @@ def _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams):
     )
 
 
+def _copy_matrix_list(matrix_list):
+    if matrix_list is None:
+        return None
+    return [None if matrix is None else np.array(matrix, copy=True) for matrix in matrix_list]
+
+
+def _copy_array(array_value):
+    if array_value is None:
+        return None
+    return np.array(array_value, copy=True)
+
+
+def _build_penalty_solution_payload(uavs_sen_beams=None,
+                                    uavs_off_beams=None,
+                                    bs_2_uav_freqs_norm=None,
+                                    auxiliary_variable_z=None,
+                                    cus_off_duration=None):
+    return {
+        "uavs_sen_beams": _copy_matrix_list(uavs_sen_beams),
+        "uavs_off_beams": _copy_matrix_list(uavs_off_beams),
+        "bs_2_uav_freqs_norm": _copy_array(bs_2_uav_freqs_norm),
+        "auxiliary_variable_z": _copy_array(auxiliary_variable_z),
+        "cus_off_duration": _copy_array(cus_off_duration),
+    }
+
+
+def _format_penalty_cccp_return(return_values, return_solution=False, solution_payload=None):
+    if return_solution:
+        return (*return_values, solution_payload)
+    return return_values
+
+
 def _solve_penalty_problem_with_fusion(args, active_groups, static_constraint_data,
                                        hat_auxiliary_variable_z, hat_bs_2_uav_freqs_norm,
                                        hat_uav_sen_beams, hat_uav_off_beams,
@@ -1875,7 +1938,8 @@ def penalty_based_cccp_fusion(args,
                               use_penalty_rank1=True,
                               cus_entertaining_task_size=None,
                               fixed_total_iterations=None,
-                              disable_early_stop=False):
+                              disable_early_stop=False,
+                              return_solution=False):
     """
     基于惩罚的 CCCP 算法求解器，使用 MOSEK Fusion 作为子问题求解器
     """
@@ -1960,6 +2024,7 @@ def penalty_based_cccp_fusion(args,
     rank1_off_val_list = []
     per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
+    final_solution_payload = None
 
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
 
@@ -2000,7 +2065,11 @@ def penalty_based_cccp_fusion(args,
         energy_val_list.append(float("inf"))
         rank1_sen_val_list.append(float("inf"))
         rank1_off_val_list.append(float("inf"))
-        return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+        return _format_penalty_cccp_return(
+            (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+            return_solution=return_solution,
+            solution_payload=final_solution_payload,
+        )
 
     init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
     init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
@@ -2049,18 +2118,25 @@ def penalty_based_cccp_fusion(args,
     rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
     # print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
     print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
-    print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
+    # print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
     # print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
     # print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
     print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
-    print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
-    print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
+    # print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
+    # print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
     original_obj_val_list.append(init_original_obj_fun_val)
     energy_val_list.append(init_pure_energy_val)
     rank1_sen_val_list.append(init_rank1_sen_sum)
     rank1_off_val_list.append(init_rank1_off_sum)
     cur_original_obj_fun_val = init_original_obj_fun_val
     obj_fun_opt = init_original_obj_fun_val
+    final_solution_payload = _build_penalty_solution_payload(
+        uavs_sen_beams=init_uavs_sen_beams,
+        uavs_off_beams=init_uavs_off_beams,
+        bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+        auxiliary_variable_z=init_auxiliary_variable_z,
+        cus_off_duration=init_cus_off_duration,
+    )
 
     for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
@@ -2109,7 +2185,11 @@ def penalty_based_cccp_fusion(args,
                 rank1_sen_val_list.append(float("inf"))
                 rank1_off_val_list.append(float("inf"))
                 # print("内层问题不可解")
-                return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+                return _format_penalty_cccp_return(
+                    (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+                    return_solution=return_solution,
+                    solution_payload=final_solution_payload,
+                )
 
             cur_surrogate_opt_val = float(np.real(fusion_result["objective_value"]))
             cur_uavs_sen_beams = fusion_result["uavs_sen_beams"]
@@ -2147,8 +2227,9 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_cur=uavs_pos_cur
             )
             # print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
+            print("-------------------------------------------------------- ")
             print(f"第 {iter_count} 轮 原始目标函数值 {cur_original_obj_fun_val}")
-            print(f"第 {iter_count} 轮 纯能量消耗: {cur_pure_energy_val}")
+            # print(f"第 {iter_count} 轮 纯能量消耗: {cur_pure_energy_val}")
             # print(f"第 {iter_count} 轮线性化子问题曲线 {cur_surrogate_opt_val}")
 
             for i in range(args.uavs_num):
@@ -2170,12 +2251,19 @@ def penalty_based_cccp_fusion(args,
             rank1_gap_max, cur_rank1_sum, cur_rank1_sen_sum, cur_rank1_off_sum = _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams)
             # print(f"第 {iter_count} 轮 最大rank1 gap: {rank1_gap_max}")
             print(f"第 {iter_count} 轮 rank1 gap 总和: {cur_rank1_sum}")
-            print(f"第 {iter_count} 轮 w_gap 总和: {cur_rank1_sen_sum}")
-            print(f"第 {iter_count} 轮 b_gap 总和: {cur_rank1_off_sum}")
+            # print(f"第 {iter_count} 轮 w_gap 总和: {cur_rank1_sen_sum}")
+            # print(f"第 {iter_count} 轮 b_gap 总和: {cur_rank1_off_sum}")
             original_obj_val_list.append(cur_original_obj_fun_val)
             energy_val_list.append(cur_pure_energy_val)
             rank1_sen_val_list.append(cur_rank1_sen_sum)
             rank1_off_val_list.append(cur_rank1_off_sum)
+            final_solution_payload = _build_penalty_solution_payload(
+                uavs_sen_beams=cur_uavs_sen_beams,
+                uavs_off_beams=cur_uavs_off_beams,
+                bs_2_uav_freqs_norm=cur_bs_2_uav_freqs_norm,
+                auxiliary_variable_z=cur_auxiliary_variable_z,
+                cus_off_duration=cur_cus_off_duration,
+            )
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -2205,7 +2293,11 @@ def penalty_based_cccp_fusion(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+    return _format_penalty_cccp_return(
+        (obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+        return_solution=return_solution,
+        solution_payload=final_solution_payload,
+    )
 
 
 def solve_initial_anchor_problem_with_cvxpy(args,
@@ -2253,7 +2345,8 @@ def penalty_based_cccp(args,
                        use_penalty_rank1 = True,
                        cus_entertaining_task_size = None,
                        fixed_total_iterations = None,
-                       disable_early_stop = False
+                       disable_early_stop = False,
+                       return_solution = False
                        ):
     """
     基于惩罚的 CCCP 算法
@@ -2273,6 +2366,7 @@ def penalty_based_cccp(args,
     :param cus_entertaining_task_size: CUs 娱乐任务大小 (维度: J)，如果为 None 则在指定范围内随机生成
     :param fixed_total_iterations: 固定的总迭代次数，如果为 None 则使用默认的迭代调度策略
     :param disable_early_stop: 是否禁用基于目标函数值变化率的早停机制
+    :param return_solution: 是否额外返回最终波束和辅助变量
     :return obj_fun_opt: 最优目标函数值
     """
     if str(args.solver_backend).lower() == "fusion":
@@ -2291,7 +2385,8 @@ def penalty_based_cccp(args,
             use_penalty_rank1=use_penalty_rank1,
             cus_entertaining_task_size=cus_entertaining_task_size,
             fixed_total_iterations=fixed_total_iterations,
-            disable_early_stop=disable_early_stop
+            disable_early_stop=disable_early_stop,
+            return_solution=return_solution,
         )
 
     if cus_entertaining_task_size is None:
@@ -2442,6 +2537,7 @@ def penalty_based_cccp(args,
     rank1_off_val_list = []
     per_uav_energy_list = []
     cur_original_obj_fun_val = float('inf')
+    final_solution_payload = None
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
 
     init_problem_result = solve_initial_anchor_problem_with_cvxpy(
@@ -2466,7 +2562,11 @@ def penalty_based_cccp(args,
         rank1_sen_val_list.append(float("inf"))
         rank1_off_val_list.append(float("inf"))
         per_uav_energy_list = [float("inf")] * args.uavs_num
-        return float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+        return _format_penalty_cccp_return(
+            (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+            return_solution=return_solution,
+            solution_payload=final_solution_payload,
+        )
 
     init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
     init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
@@ -2526,6 +2626,13 @@ def penalty_based_cccp(args,
     rank1_off_val_list.append(init_rank1_off_sum)
     cur_original_obj_fun_val = init_original_obj_fun_val
     obj_fun_opt = init_original_obj_fun_val
+    final_solution_payload = _build_penalty_solution_payload(
+        uavs_sen_beams=init_uavs_sen_beams,
+        uavs_off_beams=init_uavs_off_beams,
+        bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+        auxiliary_variable_z=init_auxiliary_variable_z,
+        cus_off_duration=init_cus_off_duration,
+    )
 
     for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
@@ -2539,7 +2646,11 @@ def penalty_based_cccp(args,
             cur_surrogate_opt_val = float(np.real(problem.objective.value))
             if problem.status in ("infeasible", "infeasible_inaccurate"):
                 print("当前状态下不存在可行原始解，CVXPY 无法为大多数约束计算 violation。")
-                return float('inf'), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+                return _format_penalty_cccp_return(
+                    (float('inf'), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+                    return_solution=return_solution,
+                    solution_payload=final_solution_payload,
+                )
             elif problem.status in ("optimal", "optimal_inaccurate", "unbounded", "unbounded_inaccurate"):
                 cur_original_obj_fun_val = compute_original_obj_fun_value(
                     args=args,
@@ -2600,6 +2711,13 @@ def penalty_based_cccp(args,
             energy_val_list.append(cur_pure_energy_val)
             rank1_sen_val_list.append(cur_rank1_sen_sum)
             rank1_off_val_list.append(cur_rank1_off_sum)
+            final_solution_payload = _build_penalty_solution_payload(
+                uavs_sen_beams=[v.value for v in var_uavs_sen_beam],
+                uavs_off_beams=[v.value for v in var_uavs_off_beam],
+                bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm.value,
+                auxiliary_variable_z=var_auxiliary_variable_z.value,
+                cus_off_duration=var_cus_off_duration.value,
+            )
 
             if args.enable_first_iter_rank_boost and outer_iter == 0 and inner_iter == 0:
                 first_iter_rank_boost_lb.value = 0.0
@@ -2651,7 +2769,43 @@ def penalty_based_cccp(args,
                                               cur_penalty_factor, rank1_sen_scaled_proj_mats, rank1_off_scaled_proj_mats,
                                               rank1_const_terms)
 
-    return obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list
+    return _format_penalty_cccp_return(
+        (obj_fun_opt, iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+        return_solution=return_solution,
+        solution_payload=final_solution_payload,
+    )
+
+
+def penalty_based_cccp_random_init(args,
+                                   uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels, uavs_2_targets_channels,
+                                   uavs_targets_matched_matrix, uavs_cus_matched_matrix,
+                                   uavs_pos_pre, uavs_pos_cur, uavs_off_duration, cus_off_power,
+                                   use_penalty_rank1=True,
+                                   cus_entertaining_task_size=None,
+                                   fixed_total_iterations=None,
+                                   disable_early_stop=False):
+    original_initializer = globals()["initialize_uav_beams"]
+    globals()["initialize_uav_beams"] = initialize_uav_beams_random
+    try:
+        return penalty_based_cccp(
+            args=args,
+            uavs_2_cus_channels=uavs_2_cus_channels,
+            uavs_2_bs_channels=uavs_2_bs_channels,
+            cus_2_bs_channels=cus_2_bs_channels,
+            uavs_2_targets_channels=uavs_2_targets_channels,
+            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+            uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            use_penalty_rank1=use_penalty_rank1,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            fixed_total_iterations=fixed_total_iterations,
+            disable_early_stop=disable_early_stop,
+        )
+    finally:
+        globals()["initialize_uav_beams"] = original_initializer
 
 
 def generate_rho_sweep_energy_csv(args,
@@ -2710,6 +2864,124 @@ def generate_rho_sweep_energy_csv(args,
     return output_paths
 
 
+def generate_random_case_convergence_csv(args,
+                                         num_cases=None,
+                                         csv_prefix=None,
+                                         use_penalty_rank1=True):
+    """
+    随机生成多个有效 case，统计每个 case 的 CCCP 收敛迭代次数，并保存到 CSV 文件。
+
+    若当前 case 求解结果为 INF，则丢弃该 case 并重新随机生成，
+    直到收集满 num_cases 个有效 case 为止。
+    """
+    if num_cases is None:
+        num_cases = args.num_cases
+    if csv_prefix is None:
+        csv_prefix = date_str
+
+    rng = np.random.default_rng(args.seed)
+    np_random_state = np.random.get_state()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    output_path = os.path.join(base_dir, f"{csv_prefix}_random_case_convergence_iterations.csv")
+    results = []
+
+    try:
+        accepted_case_count = 0
+        total_attempt_count = 0
+        while accepted_case_count < num_cases:
+            total_attempt_count += 1
+            run_args = argparse.Namespace(**vars(args))
+            run_args.uavs_num = int(rng.integers(2, 7))
+            run_args.cus_num = int(rng.integers(4, 13))
+            run_args.uav_max_delay = float(rng.uniform(0.2, 0.4))
+            run_args.enable_cccp_diagnostics = False
+
+            cus_entertaining_task_size = rng.uniform(140e3, 200e3, run_args.cus_num)
+            case_seed = int(rng.integers(0, 2 ** 31 - 1))
+            np.random.seed(case_seed)
+
+            print("======================================================== ")
+            print(f"随机 case 尝试 {total_attempt_count}, 当前已收集有效 case {accepted_case_count}/{num_cases}")
+            print(f"UAV 数量 = {run_args.uavs_num}, CU 数量 = {run_args.cus_num}, UAV 最大容忍时延 = {run_args.uav_max_delay:.4f}s")
+
+            uavs_pos, cus_pos, targets_pos = generate_pos(
+                uavs_num=run_args.uavs_num,
+                cus_num=run_args.cus_num,
+                targets_num=run_args.targets_num,
+                center=(0, 0),
+                radius=run_args.radius,
+                uav_height=run_args.uav_height
+            )
+
+            uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels = compute_com_channel_gain(
+                uavs_pos=uavs_pos,
+                cus_pos=cus_pos,
+                ref_path_loss=db_2_watt(run_args.ref_path_loss_db),
+                frac_d_lambda=run_args.frac_d_lambda,
+                alpha_uav_link=run_args.alpha_uav_link,
+                alpha_cu_link=run_args.alpha_cu_link,
+                rician_factor=db_2_watt(run_args.rician_factor_db),
+                antenna_nums=run_args.antenna_nums
+            )
+
+            uavs_2_targets_channels = compute_sen_channel_gain(
+                radar_rcs=run_args.radar_rcs,
+                frac_d_lambda=run_args.frac_d_lambda,
+                uavs_pos=uavs_pos,
+                targets_pos=targets_pos,
+                antenna_nums=run_args.antenna_nums,
+                ref_path_loss=db_2_watt(run_args.ref_path_loss_db)
+            )
+
+            uavs_cus_matched_matrix = random_choose_matched_matrix(uavs_pos=uavs_pos, cus_pos=cus_pos)
+            uavs_targets_matched_matrix = match_uav_targets_nearest(uavs_pos=uavs_pos, targets_pos=targets_pos)
+            uavs_pos_cur = compute_uav_pos_cur(args=run_args, uavs_pos_pre=uavs_pos)
+
+            uavs_off_duration = np.full(run_args.uavs_num, (run_args.uav_max_delay - run_args.uav_sen_duration) * 0.8)
+            cus_off_power = np.full(run_args.cus_num, dbm_2_watt(run_args.cu_max_power_dbm) / 5)
+
+            objective_value, iter_count, _, _, _, _, _ = penalty_based_cccp(
+                args=run_args,
+                uavs_2_cus_channels=uavs_2_cus_channels,
+                uavs_2_bs_channels=uavs_2_bs_channels,
+                cus_2_bs_channels=cus_2_bs_channels,
+                uavs_2_targets_channels=uavs_2_targets_channels,
+                uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+                uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+                uavs_pos_pre=uavs_pos,
+                uavs_pos_cur=uavs_pos_cur,
+                uavs_off_duration=uavs_off_duration,
+                cus_off_power=cus_off_power,
+                use_penalty_rank1=use_penalty_rank1,
+                cus_entertaining_task_size=cus_entertaining_task_size,
+            )
+
+            if (not np.isfinite(objective_value)) or (not np.isfinite(iter_count)):
+                print("当前 case 求解结果为 INF，已丢弃并重新生成新的 case。")
+                continue
+
+            accepted_case_count += 1
+            results.append({
+                "case_id": accepted_case_count,
+                "convergence_iterations": iter_count,
+            })
+    finally:
+        np.random.set_state(np_random_state)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "case_id",
+                "convergence_iterations",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    return output_path
+
+
 def dbm_2_watt(dbm):
     """
     将 dBm 转换为瓦特
@@ -2733,7 +3005,7 @@ def db_2_watt(db):
 if __name__ == "__main__":
     # 获取参数
     args = get_base_args()
-    np.random.seed(args.seed)  # 确保仿真结果可复现
+    # np.random.seed(args.seed)  # 确保仿真结果可复现
     
     uavs_pos, cus_pos, targets_pos = generate_pos(
         uavs_num=args.uavs_num, cus_num=args.cus_num, targets_num=args.targets_num,
@@ -2763,8 +3035,51 @@ if __name__ == "__main__":
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
     
-    # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    # energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list = penalty_based_cccp(
+    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
+    energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
+        args=args,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_2_targets_channels=uavs_2_targets_channels,
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_pos_pre=uavs_pos,
+        uavs_pos_cur=uavs_pos_cur,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+        use_penalty_rank1=True,
+        cus_entertaining_task_size=cus_entertaining_task_size,
+        return_solution=True,
+    )
+    if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
+        beam_pattern_save_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
+        )
+        plot_uav_sensing_beam_patterns(
+            args=args,
+            uavs_sen_beams=final_solution["uavs_sen_beams"],
+            uavs_pos=uavs_pos,
+            targets_pos=targets_pos,
+            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+            save_path=beam_pattern_save_path,
+        )
+    # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(original_obj_val_list)
+    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(energy_val_list)
+    # with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_sen_val_list)
+    # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_off_val_list)
+
+    # # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
+    # generate_rho_sweep_energy_csv(
     #     args=args,
     #     uavs_2_cus_channels=uavs_2_cus_channels,
     #     uavs_2_bs_channels=uavs_2_bs_channels,
@@ -2779,32 +3094,7 @@ if __name__ == "__main__":
     #     use_penalty_rank1=True,
     #     cus_entertaining_task_size=cus_entertaining_task_size,
     # )
-    # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(original_obj_val_list)
-    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(energy_val_list)
-    # with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(rank1_sen_val_list)
-    # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(rank1_off_val_list)
 
-    # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
-    generate_rho_sweep_energy_csv(
-        args=args,
-        uavs_2_cus_channels=uavs_2_cus_channels,
-        uavs_2_bs_channels=uavs_2_bs_channels,
-        cus_2_bs_channels=cus_2_bs_channels,
-        uavs_2_targets_channels=uavs_2_targets_channels,
-        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-        uavs_pos_pre=uavs_pos,
-        uavs_pos_cur=uavs_pos_cur,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        use_penalty_rank1=True,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-    )
+    # # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
+    # random_case_csv_path = generate_random_case_convergence_csv(args=args)
+    # print(f"随机 case 收敛次数 CSV 已保存到: {random_case_csv_path}")
