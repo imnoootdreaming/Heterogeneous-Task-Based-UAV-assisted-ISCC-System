@@ -11,7 +11,7 @@ from datetime import datetime  # 新增
 import csv  # 新增：用于将迭代数据写入 CSV 文件
 # from gaussian_based_cccp_algorithm import gaussian_based_cccp, save_and_plot_gaussian_cccp_history
 from scipy.optimize import linear_sum_assignment  # 引入线性求和分配函数
-from plot_uav_sensing_beam_pattern import plot_uav_sensing_beam_patterns
+# from plot_uav_sensing_beam_pattern import plot_uav_sensing_beam_patterns
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings('error', category=RuntimeWarning)  # 把 RuntimeWarning 当作异常处理
 date_str = datetime.now().strftime("%Y%m%d_%H%M%S")  # 新增
@@ -23,11 +23,11 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=20, help="目标数量")
+    base_parser.add_argument("--targets_num", type=int, default=30, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
-    base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
+    base_parser.add_argument("--radius", type=float, default=600, help="区域半径 (m)")
 
     # 信道参数
     base_parser.add_argument("--ref_path_loss_db", type=float, default=-30, help="1m 参考路径损耗 (dB)")
@@ -46,7 +46,7 @@ def get_base_args():
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
     base_parser.add_argument("--bs_max_freq", type=float, default=10e9, help="BS 最大工作频率 (Hz)")
     base_parser.add_argument("--freq_scale", type=float, default=1e9, help="频率归一化尺度")
-    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  # 20260321 - 修改了 obj5
+    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  
     base_parser.add_argument("--bs_cycles_per_bit", type=float, default=1000, help="BS 处理 1bit 需要的周期数")
     base_parser.add_argument("--time_slot_duration", type=float, default=0.6, help="时隙长度 (s)")
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
@@ -54,7 +54,7 @@ def get_base_args():
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
     base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
+    base_parser.add_argument("--uav_max_speed", type=float, default=40.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
     base_parser.add_argument("--sen_sinr", type=float, default=20, help="感知门限阈值 (dB)")
@@ -82,7 +82,7 @@ def get_base_args():
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
-    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-16, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-10, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
     base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=False,
                              help="开关参数")
     base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
@@ -2117,11 +2117,11 @@ def penalty_based_cccp_fusion(args,
     )
     rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
     # print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
-    print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
+    # print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
     # print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
     # print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
     # print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
-    print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
+    # print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
     # print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
     # print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
     original_obj_val_list.append(init_original_obj_fun_val)
@@ -2227,8 +2227,8 @@ def penalty_based_cccp_fusion(args,
                 uavs_pos_cur=uavs_pos_cur
             )
             # print(f"第 {iter_count} 轮 目标函数值 : {fusion_result['objective_value']}")
-            print("-------------------------------------------------------- ")
-            print(f"第 {iter_count} 轮 原始目标函数值 {cur_original_obj_fun_val}")
+            # print("-------------------------------------------------------- ")
+            # print(f"第 {iter_count} 轮 原始目标函数值 {cur_original_obj_fun_val}")
             # print(f"第 {iter_count} 轮 纯能量消耗: {cur_pure_energy_val}")
             # print(f"第 {iter_count} 轮线性化子问题曲线 {cur_surrogate_opt_val}")
 
@@ -2250,7 +2250,7 @@ def penalty_based_cccp_fusion(args,
 
             rank1_gap_max, cur_rank1_sum, cur_rank1_sen_sum, cur_rank1_off_sum = _compute_rank1_gap_metrics(cur_uavs_sen_beams, cur_uavs_off_beams)
             # print(f"第 {iter_count} 轮 最大rank1 gap: {rank1_gap_max}")
-            print(f"第 {iter_count} 轮 rank1 gap 总和: {cur_rank1_sum}")
+            # print(f"第 {iter_count} 轮 rank1 gap 总和: {cur_rank1_sum}")
             # print(f"第 {iter_count} 轮 w_gap 总和: {cur_rank1_sen_sum}")
             # print(f"第 {iter_count} 轮 b_gap 总和: {cur_rank1_off_sum}")
             original_obj_val_list.append(cur_original_obj_fun_val)
@@ -2367,7 +2367,7 @@ def penalty_based_cccp(args,
     :param fixed_total_iterations: 固定的总迭代次数，如果为 None 则使用默认的迭代调度策略
     :param disable_early_stop: 是否禁用基于目标函数值变化率的早停机制
     :param return_solution: 是否额外返回最终波束和辅助变量
-    :return obj_fun_opt: 最优目标函数值
+    :return: objective_value, total_iterations, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, (optional) solution_payload
     """
     if str(args.solver_backend).lower() == "fusion":
         return penalty_based_cccp_fusion(
@@ -3035,36 +3035,36 @@ if __name__ == "__main__":
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
     
-    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
-        args=args,
-        uavs_2_cus_channels=uavs_2_cus_channels,
-        uavs_2_bs_channels=uavs_2_bs_channels,
-        cus_2_bs_channels=cus_2_bs_channels,
-        uavs_2_targets_channels=uavs_2_targets_channels,
-        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-        uavs_pos_pre=uavs_pos,
-        uavs_pos_cur=uavs_pos_cur,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        use_penalty_rank1=True,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        return_solution=True,
-    )
-    if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
-        beam_pattern_save_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
-        )
-        plot_uav_sensing_beam_patterns(
-            args=args,
-            uavs_sen_beams=final_solution["uavs_sen_beams"],
-            uavs_pos=uavs_pos,
-            targets_pos=targets_pos,
-            uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-            save_path=beam_pattern_save_path,
-        )
+    # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
+    # energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
+    #     args=args,
+    #     uavs_2_cus_channels=uavs_2_cus_channels,
+    #     uavs_2_bs_channels=uavs_2_bs_channels,
+    #     cus_2_bs_channels=cus_2_bs_channels,
+    #     uavs_2_targets_channels=uavs_2_targets_channels,
+    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+    #     uavs_pos_pre=uavs_pos,
+    #     uavs_pos_cur=uavs_pos_cur,
+    #     uavs_off_duration=uavs_off_duration,
+    #     cus_off_power=cus_off_power,
+    #     use_penalty_rank1=True,
+    #     cus_entertaining_task_size=cus_entertaining_task_size,
+    #     return_solution=True,
+    # )
+    # if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
+    #     beam_pattern_save_path = os.path.join(
+    #         os.path.dirname(os.path.abspath(__file__)),
+    #         f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
+    #     )
+    #     plot_uav_sensing_beam_patterns(
+    #         args=args,
+    #         uavs_sen_beams=final_solution["uavs_sen_beams"],
+    #         uavs_pos=uavs_pos,
+    #         targets_pos=targets_pos,
+    #         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #         save_path=beam_pattern_save_path,
+    #     )
     # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
     #     writer = csv.writer(f)
     #     writer.writerow(original_obj_val_list)
@@ -3095,6 +3095,6 @@ if __name__ == "__main__":
     #     cus_entertaining_task_size=cus_entertaining_task_size,
     # )
 
-    # # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
-    # random_case_csv_path = generate_random_case_convergence_csv(args=args)
-    # print(f"随机 case 收敛次数 CSV 已保存到: {random_case_csv_path}")
+    # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
+    random_case_csv_path = generate_random_case_convergence_csv(args=args)
+    print(f"随机 case 收敛次数 CSV 已保存到: {random_case_csv_path}")

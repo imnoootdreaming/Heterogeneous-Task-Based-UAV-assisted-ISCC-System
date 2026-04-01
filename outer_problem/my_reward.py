@@ -54,12 +54,17 @@ class MyReward:
             cus_entertaining_task_size=cus_entertaining_task_size
         )
 
-        total_reward_4_energy = np.exp(-energy_opt / 10)
+        no_solution_penalty = 0
+        if energy_opt == float("inf"):
+            no_solution_penalty = 1
+
+        total_reward_4_energy = np.exp(-energy_opt / 100)
         total_reward = (
             total_reward_4_energy
             - bs_alloc_spectrum_penalty
             - np.sum(uav_exceed_boundary_penalty)
             - np.sum(uav_collision_penalty)
+            - no_solution_penalty
         )
 
         reward = {
@@ -69,6 +74,7 @@ class MyReward:
                 "bs_alloc_spectrum_penalty": float(bs_alloc_spectrum_penalty),
                 "uav_exceed_boundary_penalty_sum": float(np.sum(uav_exceed_boundary_penalty)),
                 "uav_collision_penalty_sum": float(np.sum(uav_collision_penalty)),
+                "no_solution_penalty":float(no_solution_penalty)
             }
         }
         return float(total_reward), reward, energy_opt

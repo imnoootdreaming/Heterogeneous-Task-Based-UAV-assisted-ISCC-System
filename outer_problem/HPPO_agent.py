@@ -76,12 +76,13 @@ class MultiHeadActor(nn.Module):
 
         continuous_actions = []
         total_log_prob = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
-
+        con_log_prob = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
         for head_name in self.continuous_head_names:
             dist = continuous_dists[head_name]
             action = dist.sample()
             continuous_actions.append(action)
             total_log_prob = total_log_prob + dist.log_prob(action).sum(dim=-1, keepdim=True)
+            con_log_prob = con_log_prob + dist.log_prob(action).sum(dim=-1, keepdim=True)
 
         if continuous_actions:
             continuous_actions = torch.cat(continuous_actions, dim=-1)
@@ -89,41 +90,48 @@ class MultiHeadActor(nn.Module):
             continuous_actions = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
 
         discrete_actions = []
+        dis_log_prob = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
         for dist in discrete_dists:
             action = dist.sample()
             discrete_actions.append(action.unsqueeze(-1))
             total_log_prob = total_log_prob + dist.log_prob(action).unsqueeze(-1)
-
+            dis_log_prob = dis_log_prob + dist.log_prob(action).unsqueeze(-1)
+        
         if discrete_actions:
             discrete_actions = torch.cat(discrete_actions, dim=-1)
         else:
             discrete_actions = torch.empty((batch_size, 0), dtype=torch.long, device=device)
 
-        return continuous_actions, discrete_actions, total_log_prob
+        return continuous_actions, discrete_actions, total_log_prob, con_log_prob, dis_log_prob
 
     def evaluate_actions(self, s, continuous_actions, discrete_actions):
         continuous_dists, discrete_dists = self._get_dists(s)
         batch_size = s.size(0)
         device = s.device
 
-        total_log_prob = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
-        total_entropy = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
+        # NOTE - 统计连续动作和离散动作的 log_prob 和 entropy
+        cont_log_prob = torch.zeros((batch_size, 1), device=device)
+        disc_log_prob = torch.zeros((batch_size, 1), device=device)
+        cont_entropy = torch.zeros((batch_size, 1), device=device)
+        disc_entropy = torch.zeros((batch_size, 1), device=device)
 
         start_idx = 0
         for head_name in self.continuous_head_names:
             head_dim = self.continuous_action_splits[head_name]
             action_slice = continuous_actions[:, start_idx:start_idx + head_dim]
             dist = continuous_dists[head_name]
-            total_log_prob = total_log_prob + dist.log_prob(action_slice).sum(dim=-1, keepdim=True)
-            total_entropy = total_entropy + dist.entropy().sum(dim=-1, keepdim=True)
+            cont_log_prob += dist.log_prob(action_slice).sum(dim=-1, keepdim=True)
+            cont_entropy += dist.entropy().sum(dim=-1, keepdim=True)
             start_idx += head_dim
 
         for head_idx, dist in enumerate(discrete_dists):
             action_slice = discrete_actions[:, head_idx]
-            total_log_prob = total_log_prob + dist.log_prob(action_slice).unsqueeze(-1)
-            total_entropy = total_entropy + dist.entropy().unsqueeze(-1)
+            disc_log_prob += dist.log_prob(action_slice).unsqueeze(-1)
+            disc_entropy += dist.entropy().unsqueeze(-1)
 
-        return total_log_prob, total_entropy
+        # 返回总和以及分量
+        return (cont_log_prob + disc_log_prob), (cont_entropy + disc_entropy), \
+            cont_log_prob, disc_log_prob, cont_entropy, disc_entropy
 
 
 class Critic(nn.Module):
@@ -146,9 +154,7 @@ class Critic(nn.Module):
 class HPPO:
     def __init__(self, state_dim, hidden_dim, continuous_action_splits, discrete_action_dims,
                  action_low, action_high, actor_lr, critic_lr, lmbda, eps, gamma, epochs,
-                 num_episodes, device, entropy_coef=0.01):
-        # NOTE - Keep the original class name to minimize changes in the training script,
-        # while the actor itself is now a single-agent mixed-action multi-head PPO policy.
+                 num_episodes, device, entropy_coef=0.01, discrete_entropy_coef=0.01, continuous_entropy_coef=0.05):
         self.continuous_action_splits = continuous_action_splits
         self.discrete_action_dims = np.asarray(discrete_action_dims, dtype=np.int64)
         self.actor = MultiHeadActor(
@@ -171,17 +177,20 @@ class HPPO:
         self.entropy_coef = entropy_coef
         self.action_low = np.asarray(action_low, dtype=np.float32)
         self.action_high = np.asarray(action_high, dtype=np.float32)
+        # NOTE - Actor Loss 中的离散和连续动作的权重
+        self.discrete_entropy_coef = discrete_entropy_coef
+        self.continuous_entropy_coef = continuous_entropy_coef
 
     def choose_action(self, s):
         s = torch.tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            continuous_actions, discrete_actions, log_prob = self.actor.sample(s)
+            continuous_actions, discrete_actions, log_prob, con_log_prob, dis_log_prob = self.actor.sample(s)
 
         action = {
             "continuous": continuous_actions.squeeze(0).cpu().numpy().astype(np.float32),
             "discrete": discrete_actions.squeeze(0).cpu().numpy().astype(np.int64),
         }
-        return action, log_prob.squeeze(0).cpu().numpy()
+        return action, log_prob.squeeze(0).cpu().numpy(), con_log_prob.squeeze(0).cpu().numpy(), dis_log_prob.squeeze(0).cpu().numpy()
 
     def update(self, transition_dict, step=None, writer=None, agent_name="Agent"):
         states = torch.tensor(transition_dict["states"], dtype=torch.float32, device=self.device)
@@ -197,8 +206,12 @@ class HPPO:
         next_states = torch.tensor(
             transition_dict["next_states"], dtype=torch.float32, device=self.device
         )
-        old_log_probs = torch.tensor(
-            transition_dict["old_log_probs"], dtype=torch.float32, device=self.device
+        # NOTE - 连续动作和离散动作各自的 log_probs
+        old_cont_lps = torch.tensor(
+            transition_dict["old_cont_log_probs"], dtype=torch.float32, device=self.device
+        ).view(-1, 1)
+        old_disc_lps = torch.tensor(
+            transition_dict["old_disc_log_probs"], dtype=torch.float32, device=self.device
         ).view(-1, 1)
         dones = torch.tensor(
             transition_dict["dones"], dtype=torch.float32, device=self.device
@@ -228,35 +241,57 @@ class HPPO:
 
         actor_losses = []
         critic_losses = []
+        # 连续动作和离散动作的 log_prob
+        c_lps, d_lps = [], []
+        # 连续动作和离散动作的 entropy
+        c_ents, d_ents = [], [] 
 
         batch_size = states.size(0)
-        mini_batch_size = min(64, batch_size)
-
+        mini_batch_size = min(32, batch_size)
+        
+        # 辅助函数
+        def _surr(ratio, a):
+            return -torch.min(ratio * a,
+                            torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * a)
+    
         for _ in range(self.epochs):
             for index in BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, False):
-                log_probs, dist_entropy = self.actor.evaluate_actions(
+                log_probs, total_entropy, c_lp, d_lp, c_ent, d_ent = self.actor.evaluate_actions(
                     states[index],
                     continuous_actions[index],
                     discrete_actions[index]
                 )
-
-                ratio = torch.exp(log_probs - old_log_probs[index])
-                surr1 = ratio * adv[index]
-                surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * adv[index]
-                actor_loss = torch.mean(-torch.min(surr1, surr2) - self.entropy_coef * dist_entropy)
+                # 为连续动作和离散动作各自独立 ratio + clip
+                cont_ratio = torch.exp(c_lp - old_cont_lps[index])
+                disc_ratio = torch.exp(d_lp - old_disc_lps[index])
+                actor_loss = torch.mean(
+                    _surr(cont_ratio, adv[index])
+                    + _surr(disc_ratio, adv[index])
+                    - self.continuous_entropy_coef * c_ent
+                    - self.discrete_entropy_coef   * d_ent
+                )
+                # # ratio = torch.exp(log_probs - old_log_probs[index])
+                # surr1 = ratio * adv[index]
+                # surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * adv[index]
+                # actor_loss = torch.mean(
+                #     -torch.min(surr1, surr2) - self.discrete_entropy_coef * d_ent - self.continuous_entropy_coef * c_ent)
                 critic_loss = F.mse_loss(self.critic(states[index]), v_target[index].detach())
 
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1)
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1)
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
 
                 actor_losses.append(actor_loss.item())
                 critic_losses.append(critic_loss.item())
+                c_lps.append(c_lp.mean().item())
+                d_lps.append(d_lp.mean().item())
+                c_ents.append(c_ent.mean().item())
+                d_ents.append(d_ent.mean().item())
 
         if step is not None:
             self.lr_decay(step)
@@ -264,9 +299,16 @@ class HPPO:
         if writer is not None and step is not None:
             writer.add_scalar(f"{agent_name}/Actor_Loss", np.mean(actor_losses), step)
             writer.add_scalar(f"{agent_name}/Critic_Loss", np.mean(critic_losses), step)
-            kl_log_probs, _ = self.actor.evaluate_actions(states, continuous_actions, discrete_actions)
-            kl = (old_log_probs - kl_log_probs).mean().item()
+            writer.add_scalar(f"{agent_name}/Continuous_LogProb", np.mean(c_lps), step)
+            writer.add_scalar(f"{agent_name}/Discrete_LogProb", np.mean(d_lps), step)
+            writer.add_scalar(f"{agent_name}/continuous_entropy", np.mean(c_ents), step)
+            writer.add_scalar(f"{agent_name}/discrete_entropy", np.mean(d_ents), step)
+            old_lps = old_cont_lps + old_disc_lps          # 仅用于监控，不参与训练
+            res = self.actor.evaluate_actions(states, continuous_actions, discrete_actions)
+            kl_c_lp, kl_d_lp = res[2], res[3]             # 取分开的 log prob
+            kl = (old_lps - (kl_c_lp + kl_d_lp)).mean().item()
             writer.add_scalar(f"{agent_name}/KL_Divergence", kl, step)
+
 
     def lr_decay(self, total_steps):
         lr_a_now = self.actor_optimizer.defaults["lr"] * (1 - total_steps / self.num_episodes)

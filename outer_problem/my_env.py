@@ -22,7 +22,7 @@ class MyEnv(gym.Env):
         super(MyEnv, self).__init__()
         self.base_args = base_args
         self.madrl_args = madrl_args
-        self.epsilon = 1e-8
+        self.epsilon = 1e-4
         self.t = 0
         # 固定 CU 的任务量
         self.cus_entertaining_task_size = np.ones(self.base_args.cus_num) * 170e3
@@ -180,6 +180,30 @@ class MyEnv(gym.Env):
             np.zeros_like(diff_distance),
         ], axis=1)
 
+        color_reset = "\033[0m"
+        color_title = "\033[38;5;67m"
+        color_metric = "\033[38;5;109m"
+        color_energy = "\033[38;5;108m"
+        color_penalty = "\033[38;5;137m"
+        print(
+            f"=================================================="
+        )
+        # ---- Action Details ----
+        print(f"{color_title} ------------ [Action Details] ------------ {color_reset}")
+        for i in range(self.base_args.uavs_num):
+            print(
+                f"  {color_metric}UAV-{i}{color_reset}: "
+                f"angle={diff_theta[i]:.4f} rad, "
+                f"dist={diff_distance[i]:.4f} m, "
+                f"off_duration={off_duration[i]:.4f} s, "
+                f"{color_energy}→ CU-{int(discrete_actions[i])}{color_reset}"
+            )
+        for i in range(self.base_args.cus_num):
+            print(
+                f"  {color_penalty}CU-{i}{color_reset}: "
+                f"off_power={cus_off_power[i]:.4f} W"
+            )
+        
         total_reward, reward, energy_opt = self.reward_calculator.reward_compute(
             uavs_2_cus_channels=self.uavs_2_cus_channels,
             uavs_2_bs_channels=self.uavs_2_bs_channels,
@@ -193,16 +217,12 @@ class MyEnv(gym.Env):
             cus_off_power=cus_off_power,
             cus_entertaining_task_size=self.cus_entertaining_task_size
         )
-        color_reset = "\033[0m"
-        color_title = "\033[38;5;67m"
-        color_metric = "\033[38;5;109m"
-        color_energy = "\033[38;5;108m"
-        color_penalty = "\033[38;5;137m"
         print(
             f"{color_title}Episode {i_episode}, Time Slot {self.t}:{color_reset} "
             f"{color_metric}Total Reward = {total_reward:.4f}{color_reset}, "
             f"{color_energy}Energy Opt = {energy_opt:.4f}{color_reset}"
         )
+        # ---- Reward Details ----
         reward_components = reward.get("components", {})
         print(f"{color_title} ------------ [Reward Details] ------------ {color_reset}")
         print(f"  {color_metric}BS Reward{color_reset}: {reward.get('bs', 0.0):.4f}")
@@ -210,7 +230,10 @@ class MyEnv(gym.Env):
         print(f"  {color_penalty}bs_alloc_spectrum_penalty{color_reset}: {reward_components.get('bs_alloc_spectrum_penalty', 0.0):.4f}")
         print(f"  {color_penalty}uav_exceed_boundary_penalty_sum{color_reset}: {reward_components.get('uav_exceed_boundary_penalty_sum', 0.0):.4f}")
         print(f"  {color_penalty}uav_collision_penalty_sum{color_reset}: {reward_components.get('uav_collision_penalty_sum', 0.0):.4f}")
-
+        print(f"  {color_penalty}no_solution_penalty{color_reset}: {reward_components.get('no_solution_penalty', 0.0):.4f}")
+        print(
+            f"=================================================="
+        )
         self.t += 1
         self.cur_uavs_pos = next_uavs_pos
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()

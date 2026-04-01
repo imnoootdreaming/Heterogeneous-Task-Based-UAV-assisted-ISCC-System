@@ -51,7 +51,7 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=30, help="目标数量")
+    base_parser.add_argument("--targets_num", type=int, default=40, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
@@ -83,7 +83,7 @@ def get_base_args():
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
     base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
+    base_parser.add_argument("--uav_max_speed", type=float, default=40.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
     base_parser.add_argument("--sen_sinr", type=float, default=20, help="感知门限阈值 (dB)")
@@ -115,7 +115,7 @@ def get_base_args():
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
-    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-12, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-10, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
     base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=False,
                              help="开关参数")
     base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     cu_trajectory = None
     target_trajectory = None
 
-    with tqdm(total=int(madrl_args.episodes), desc="Training Progress", colour='green') as pbar:
+    with tqdm(total=int(madrl_args.episodes), desc="Training Progress") as pbar:
         for i_episode in range(int(madrl_args.episodes)):
             episode_rewards_total = []
             episode_reward_bs = 0.0
@@ -180,7 +180,8 @@ if __name__ == "__main__":
                 "discrete_actions": [],
                 "next_states": [],
                 "rewards": [],
-                "old_log_probs": [],
+                "old_cont_log_probs": [],
+                "old_disc_log_probs": [],
                 "dones": [],
                 "real_dones": [],
             }
@@ -198,7 +199,7 @@ if __name__ == "__main__":
                 target_positions_episode.append(env.getPosTarget())
 
                 state_bs_norm = running_norm_bs(np.array(s["bs"], dtype=np.float32))
-                action_bs, old_log_probs_bs = agent_bs.choose_action(state_bs_norm)
+                action_bs, old_log_probs_bs, old_con_log_probs_bs, old_dis_log_probs_bs = agent_bs.choose_action(state_bs_norm)
 
                 next_s, total_reward, r_dict, done = env.step({"bs": action_bs}, i_episode)
 
@@ -214,7 +215,8 @@ if __name__ == "__main__":
                 transition_dict_bs["discrete_actions"].append(action_bs["discrete"])
                 transition_dict_bs["next_states"].append(next_state_bs_norm)
                 transition_dict_bs["rewards"].append(r_bs_norm)
-                transition_dict_bs["old_log_probs"].append(float(np.asarray(old_log_probs_bs).item()))
+                transition_dict_bs["old_cont_log_probs"].append(float(np.asarray(old_con_log_probs_bs).item()))
+                transition_dict_bs["old_disc_log_probs"].append(float(np.asarray(old_dis_log_probs_bs).item()))
                 transition_dict_bs["dones"].append(bool(done))
                 transition_dict_bs["real_dones"].append(False)
 
@@ -239,7 +241,6 @@ if __name__ == "__main__":
             all_agents_rewards.append([avg_bs_reward])
 
             writer.add_scalar("Reward/episode", avg_total_reward, i_episode)
-            writer.add_scalar("Reward/BS", avg_bs_reward, i_episode)
 
             pbar.set_postfix({"avg_reward": f"{avg_total_reward:.3f}"})
             pbar.update(1)
