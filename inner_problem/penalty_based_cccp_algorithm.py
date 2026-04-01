@@ -23,7 +23,7 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=30, help="目标数量")
+    base_parser.add_argument("--targets_num", type=int, default=40, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
@@ -397,15 +397,15 @@ def compute_uav_pos_cur(args, uavs_pos_pre):
     # 速度向量 v = [vx, vy, vz], |v| = speed
     # q(t+1) = q(t) + v * tau
     
-    # 1. 速度大小
-    uav_speed_magnitude = np.random.uniform(args.uav_min_speed, args.uav_max_speed, args.uavs_num)
+    # 1. 固定速度大小
+    fixed_speed = (args.uav_min_speed + args.uav_max_speed) / 2
 
-    # 2. 只生成 xy 方向
+    # 2. 只生成 xy 方向随机单位向量
     random_direction_xy = np.random.randn(args.uavs_num, 2)
     random_direction_xy /= np.linalg.norm(random_direction_xy, axis=1, keepdims=True)
 
     # 3. 位移（只在 xy）
-    displacement_xy = random_direction_xy * uav_speed_magnitude[:, np.newaxis] * args.time_slot_duration
+    displacement_xy = random_direction_xy * fixed_speed * args.time_slot_duration
 
     # 4. 拼成 3D 位移（z=0）
     displacement = np.zeros_like(uavs_pos_pre)
@@ -2959,6 +2959,7 @@ def generate_random_case_convergence_csv(args,
             if (not np.isfinite(objective_value)) or (not np.isfinite(iter_count)):
                 print("当前 case 求解结果为 INF，已丢弃并重新生成新的 case。")
                 continue
+            print(f"当前 case 求解结果的目标函数值: {objective_value}, 收敛迭代次数: {iter_count}")
 
             accepted_case_count += 1
             results.append({
@@ -3052,19 +3053,6 @@ if __name__ == "__main__":
     #     cus_entertaining_task_size=cus_entertaining_task_size,
     #     return_solution=True,
     # )
-    # if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
-    #     beam_pattern_save_path = os.path.join(
-    #         os.path.dirname(os.path.abspath(__file__)),
-    #         f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
-    #     )
-    #     plot_uav_sensing_beam_patterns(
-    #         args=args,
-    #         uavs_sen_beams=final_solution["uavs_sen_beams"],
-    #         uavs_pos=uavs_pos,
-    #         targets_pos=targets_pos,
-    #         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-    #         save_path=beam_pattern_save_path,
-    #     )
     # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
     #     writer = csv.writer(f)
     #     writer.writerow(original_obj_val_list)
@@ -3077,23 +3065,6 @@ if __name__ == "__main__":
     # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
     #     writer = csv.writer(f)
     #     writer.writerow(rank1_off_val_list)
-
-    # # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
-    # generate_rho_sweep_energy_csv(
-    #     args=args,
-    #     uavs_2_cus_channels=uavs_2_cus_channels,
-    #     uavs_2_bs_channels=uavs_2_bs_channels,
-    #     cus_2_bs_channels=cus_2_bs_channels,
-    #     uavs_2_targets_channels=uavs_2_targets_channels,
-    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-    #     uavs_pos_pre=uavs_pos,
-    #     uavs_pos_cur=uavs_pos_cur,
-    #     uavs_off_duration=uavs_off_duration,
-    #     cus_off_power=cus_off_power,
-    #     use_penalty_rank1=True,
-    #     cus_entertaining_task_size=cus_entertaining_task_size,
-    # )
 
     # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
     random_case_csv_path = generate_random_case_convergence_csv(args=args)
