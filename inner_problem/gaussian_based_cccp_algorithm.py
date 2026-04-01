@@ -776,7 +776,7 @@ def gaussian_randomization_rank1_recovery(
     cus_off_power,
     uavs_pos_pre,
     uavs_pos_cur,
-    gaussian_randomization_trials=30,
+    gaussian_randomization_trials=50,
     rng=None,
 ):
     if rng is None:
@@ -989,7 +989,7 @@ def gaussian_based_cccp(
     uavs_pos_cur,
     uavs_off_duration,
     cus_off_power,
-    gaussian_randomization_trials=30,
+    gaussian_randomization_trials=50,
     gaussian_randomization_seed=None,
     cus_entertaining_task_size=None,
     fixed_total_iterations=None,

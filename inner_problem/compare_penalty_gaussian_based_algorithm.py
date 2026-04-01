@@ -19,11 +19,11 @@ def get_base_args():
     # 仿真场景参数
     base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    base_parser.add_argument("--targets_num", type=int, default=20, help="目标数量")
+    base_parser.add_argument("--targets_num", type=int, default=40, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")
     base_parser.add_argument("--cus_num", type=int, default=10, help="CU 数量")
     base_parser.add_argument("--uav_height", type=float, default=100, help="UAV 高度 (m)")
-    base_parser.add_argument("--radius", type=float, default=200, help="区域半径 (m)")
+    base_parser.add_argument("--radius", type=float, default=600, help="区域半径 (m)")
 
     # 信道参数
     base_parser.add_argument("--ref_path_loss_db", type=float, default=-30, help="1m 参考路径损耗 (dB)")
@@ -42,7 +42,7 @@ def get_base_args():
     base_parser.add_argument("--kappa", type=float, default=1e-28, help="BS CPU 有效开关电容")
     base_parser.add_argument("--bs_max_freq", type=float, default=10e9, help="BS 最大工作频率 (Hz)")
     base_parser.add_argument("--freq_scale", type=float, default=1e9, help="频率归一化尺度")
-    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  # 20260321 - 修改了 obj5
+    base_parser.add_argument("--z_scale", type=float, default=1e5, help="z 变量归一化尺度")  
     base_parser.add_argument("--bs_cycles_per_bit", type=float, default=1000, help="BS 处理 1bit 需要的周期数")
     base_parser.add_argument("--time_slot_duration", type=float, default=0.6, help="时隙长度 (s)")
     base_parser.add_argument("--uav_sen_duration", type=float, default=0.1, help="UAV 感知时长 (s)")
@@ -50,7 +50,7 @@ def get_base_args():
     base_parser.add_argument("--uav_max_power", type=float, default=10, help="UAV 最大功率 (W) = 40dBm")
     base_parser.add_argument("--cu_max_delay", type=float, default=0.6, help="娱乐任务最大延迟 (s)")
     base_parser.add_argument("--uav_max_delay", type=float, default=0.2, help="感知任务最大延迟 (s)")
-    base_parser.add_argument("--uav_max_speed", type=float, default=10.0, help="UAV 最大移动速度 (m/s)")
+    base_parser.add_argument("--uav_max_speed", type=float, default=40.0, help="UAV 最大移动速度 (m/s)")
     base_parser.add_argument("--uav_min_speed", type=float, default=5.0, help="UAV 最小移动速度 (m/s)")
     base_parser.add_argument("--uav_safe_distance", type=float, default=5.0, help="UAV 安全距离 (m)")
     base_parser.add_argument("--sen_sinr", type=float, default=20, help="感知门限阈值 (dB)")
@@ -78,7 +78,7 @@ def get_base_args():
     base_parser.add_argument("--constraint_include_groups", type=str, default="4.5,4.12,4.23,4.25,4.27,4.28,4.29,4.32,4.39,4.40,4.44,4.45,auxiliary_t,var", help="启用约束组，逗号分隔")
     base_parser.add_argument("--constraint_exclude_groups", type=str, default="", help="禁用约束组，逗号分隔")
 
-    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-16, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
+    base_parser.add_argument("--linearization_psi_floor", type=float, default=1e-10, help="CCCP 线性化里 Psi 的数值下界，避免 1/Psi 和 Psi^{-1} 爆大")
     base_parser.add_argument("--enable_first_iter_rank_boost", type=lambda x: str(x).lower() == "true", default=False,
                              help="开关参数")
     base_parser.add_argument("--first_iter_rank_boost_eps", type=float, default=0.1,
@@ -98,9 +98,9 @@ def save_case_results_to_csv(case_results, csv_path):
     fieldnames = [
         "case_id",
         "penalty_based_obj",
-        "penalty_based_iter_count",
+        "penalty_based_time",
         "gaussian_based_obj",
-        "gaussian_based_iter_count",
+        "gaussian_based_time",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as csv_file:
@@ -108,9 +108,6 @@ def save_case_results_to_csv(case_results, csv_path):
         writer.writeheader()
         writer.writerows(case_results)
 
-
-import time
-import numpy as np
 
 if __name__ == "__main__":
     args = get_base_args()
@@ -202,7 +199,8 @@ if __name__ == "__main__":
             )
             penalty_obj_opt, penalty_iter_count, penalty_energy_history, penalty_rank1_history, _, _, _ = penalty_res
             t_penalty = time.time() - start_penalty
-
+            if penalty_obj_opt == float("inf"):
+                continue
             # --- 算法 2: Gaussian-based ---
             start_gaussian = time.time()
             gaussian_res = gaussian_based_cccp(
@@ -218,10 +216,12 @@ if __name__ == "__main__":
                 uavs_off_duration=uavs_off_duration,
                 cus_off_power=cus_off_power,
                 cus_entertaining_task_size=cus_entertaining_task_size,
+                gaussian_randomization_trials = 50
             )
             gaussian_obj_opt, gaussian_iter_count, gaussian_energy_history, gaussian_rank1_history = gaussian_res
             t_gaussian = time.time() - start_gaussian
-
+            if gaussian_obj_opt == float("inf"):
+                continue
             # --- 保存结果 ---
             penalty_based_obj_list.append(float(penalty_obj_opt))
             gaussian_based_obj_list.append(float(gaussian_obj_opt))
