@@ -24,6 +24,7 @@ class MyEnv(gym.Env):
         self.madrl_args = madrl_args
         self.epsilon = 1e-4
         self.t = 0
+        self.target_hold_slots = 3  # 每 3 个时隙分配一次目标
         # 固定 CU 的任务量
         self.cus_entertaining_task_size = np.ones(self.base_args.cus_num) * 170e3
         # 生成初始 UAV / CU / 目标位置，并预计算 CU 轨迹和 UAV-目标分配调度
@@ -39,7 +40,13 @@ class MyEnv(gym.Env):
         self.precomputed_cus_traj = self.generate_cu_trajectory()
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()
 
-        self.precomputed_uav_target_schedule = self.generate_uav_target_schedule()
+        self.precomputed_uav_target_schedule, self.precomputed_uav_target_schedule_distances = self.generate_uav_target_schedule()
+        self._print_precomputed_target_schedule(
+            schedule=self.precomputed_uav_target_schedule,
+            schedule_distances=self.precomputed_uav_target_schedule_distances,
+            hold_slots=self.target_hold_slots,
+            total_time_slots=self.madrl_args.total_time_slots
+        )
         self.uavs_targets_matched_matrix = self.build_uav_targets_matched_matrix(
             self.precomputed_uav_target_schedule[self.t]
         )
@@ -97,7 +104,7 @@ class MyEnv(gym.Env):
             self.base_args.uavs_num * self.base_args.antenna_nums * 2
             + self.base_args.uavs_num * self.base_args.cus_num * self.base_args.antenna_nums * 2
             + self.base_args.cus_num * 2
-            + self.base_args.uavs_num * 3
+            + self.base_args.targets_num * 3
             + self.base_args.uavs_num * 3
         )
         self.observation_space = {
@@ -129,18 +136,15 @@ class MyEnv(gym.Env):
     def _flatten_complex(self, channel):
         return np.concatenate([channel.real.flatten(), channel.imag.flatten()]).astype(np.float32)
 
-    def _get_next_target_coords(self):
-        next_slot_idx = min(self.t + 1, self.madrl_args.total_time_slots)
-        next_target_indices = self.precomputed_uav_target_schedule[next_slot_idx]
-        # NOTE - The BS observes the next-slot sensing targets so a single policy can coordinate all UAV decisions.
-        return self.init_targets_pos[next_target_indices].astype(np.float32).flatten()
+    def _get_all_target_coords(self):
+        return self.init_targets_pos.astype(np.float32).flatten()
 
     def _build_bs_observation(self):
         return np.concatenate([
             self._flatten_complex(self.uavs_2_bs_channels),
             self._flatten_complex(self.uavs_2_cus_channels),
             self._flatten_complex(self.cus_2_bs_channels),
-            self._get_next_target_coords(),
+            self._get_all_target_coords(),
             self.cur_uavs_pos.astype(np.float32).flatten(),
         ]).astype(np.float32)
 
@@ -265,19 +269,112 @@ class MyEnv(gym.Env):
     def getPosTarget(self):
         return self.init_targets_pos.copy()
 
-    def generate_uav_target_schedule(self):
-        total_slots = self.madrl_args.total_time_slots + 1
-        schedule = np.zeros((total_slots, self.base_args.uavs_num), dtype=np.int64)
-        for t in range(total_slots):
-            if self.base_args.targets_num >= self.base_args.uavs_num:
-                schedule[t] = np.random.permutation(self.base_args.targets_num)[:self.base_args.uavs_num]
-            else:
-                schedule[t] = np.random.choice(
-                    self.base_args.targets_num,
-                    size=self.base_args.uavs_num,
-                    replace=True
+    def _get_num_target_windows(self, total_time_slots, hold_slots):
+        return int(np.ceil(total_time_slots / hold_slots))
+
+    def _validate_target_schedule_requirements(self, total_time_slots, hold_slots):
+        required_target_num = self._get_num_target_windows(total_time_slots, hold_slots) * self.base_args.uavs_num
+        if self.base_args.targets_num != required_target_num:
+            raise ValueError(
+                "The current sensing schedule requires "
+                f"targets_num == ceil(total_time_slots / hold_slots) * uavs_num. "
+                f"Got targets_num={self.base_args.targets_num}, required={required_target_num}, "
+                f"hold_slots={hold_slots}, total_time_slots={total_time_slots}."
+            )
+        return required_target_num
+
+    def _assign_targets_for_window(self, reference_positions, candidate_target_indices, target_positions=None):
+        if target_positions is None:
+            target_positions = self.init_targets_pos
+        pending_uavs = list(range(self.base_args.uavs_num))
+        pending_targets = list(candidate_target_indices)
+        assigned_targets = np.full(self.base_args.uavs_num, -1, dtype=np.int64)
+        assigned_distances = np.zeros(self.base_args.uavs_num, dtype=np.float32)
+
+        while pending_uavs:
+            best_distance = None
+            best_uav_idx = None
+            best_target_idx = None
+            best_target_list_idx = None
+
+            for uav_idx in pending_uavs:
+                candidate_targets = np.asarray(pending_targets, dtype=np.int64)
+                candidate_positions = target_positions[candidate_targets]
+                candidate_distances = np.linalg.norm(candidate_positions - reference_positions[uav_idx], axis=1)
+                nearest_local_idx = int(np.argmin(candidate_distances))
+                nearest_distance = float(candidate_distances[nearest_local_idx])
+                nearest_target_idx = int(candidate_targets[nearest_local_idx])
+
+                if best_distance is None or nearest_distance < best_distance:
+                    best_distance = nearest_distance
+                    best_uav_idx = uav_idx
+                    best_target_idx = nearest_target_idx
+                    best_target_list_idx = nearest_local_idx
+
+            assigned_targets[best_uav_idx] = best_target_idx
+            assigned_distances[best_uav_idx] = float(best_distance)
+            pending_uavs.remove(best_uav_idx)
+            pending_targets.pop(best_target_list_idx)
+
+        return assigned_targets, assigned_distances
+
+    def generate_uav_target_schedule(self, hold_slots=None, total_time_slots=None, initial_reference_positions=None):
+        if hold_slots is None:
+            hold_slots = self.target_hold_slots
+        if total_time_slots is None:
+            total_time_slots = self.madrl_args.total_time_slots
+
+        schedule = np.zeros((total_time_slots + 1, self.base_args.uavs_num), dtype=np.int64)
+        schedule_distances = np.zeros((total_time_slots + 1, self.base_args.uavs_num), dtype=np.float32)
+
+        if total_time_slots <= 0:
+            return schedule, schedule_distances
+
+        self._validate_target_schedule_requirements(total_time_slots=total_time_slots, hold_slots=hold_slots)
+        remaining_targets = list(range(self.base_args.targets_num))
+        if initial_reference_positions is None:
+            reference_positions = self.init_uavs_pos.copy()
+        else:
+            reference_positions = np.asarray(initial_reference_positions, dtype=float).copy()
+
+        for window_idx in range(self._get_num_target_windows(total_time_slots, hold_slots)):
+            assigned_targets, assigned_distances = self._assign_targets_for_window(
+                reference_positions=reference_positions,
+                candidate_target_indices=remaining_targets
+            )
+            slot_start = window_idx * hold_slots
+            slot_end = min(slot_start + hold_slots, total_time_slots)
+            schedule[slot_start:slot_end] = assigned_targets
+            schedule_distances[slot_start:slot_end] = assigned_distances
+
+            assigned_target_set = set(assigned_targets.tolist())
+            remaining_targets = [target_idx for target_idx in remaining_targets if target_idx not in assigned_target_set]
+            reference_positions = self.init_targets_pos[assigned_targets].copy()
+
+        schedule[total_time_slots] = schedule[total_time_slots - 1]
+        schedule_distances[total_time_slots] = schedule_distances[total_time_slots - 1]
+        return schedule, schedule_distances
+
+    def _print_precomputed_target_schedule(self, schedule, schedule_distances, hold_slots, total_time_slots):
+        print("==================================================")
+        print("------------ [Precomputed Target Schedule] ------------")
+        for t in range(total_time_slots):
+            window_idx = t // hold_slots
+            window_start = window_idx * hold_slots + 1
+            window_end = min((window_idx + 1) * hold_slots, total_time_slots)
+            assignment_parts = []
+            for uav_idx in range(self.base_args.uavs_num):
+                target_idx = int(schedule[t, uav_idx])
+                transition_distance = float(schedule_distances[t, uav_idx])
+                assignment_parts.append(
+                    f"UAV-{uav_idx}->Target-{target_idx} (planned_transition_distance={transition_distance:.4f} m)"
                 )
-        return schedule
+            print(
+                f"Time Slot {t + 1:02d}/{total_time_slots} | "
+                f"Window {window_idx + 1} ({window_start}-{window_end}) | "
+                + " | ".join(assignment_parts)
+            )
+        print("==================================================")
 
     def build_uav_targets_matched_matrix(self, target_indices):
         matched_matrix = np.zeros((self.base_args.uavs_num, self.base_args.targets_num), dtype=np.float32)
@@ -291,13 +388,6 @@ class MyEnv(gym.Env):
         return matched_matrix
 
     def generate_pos(self, uavs_num, cus_num, targets_num, center, radius, uav_height):
-        r_uav = radius * np.sqrt(np.random.rand(uavs_num))
-        theta_uav = np.random.rand(uavs_num) * 2 * np.pi
-        uavs_pos = np.zeros((uavs_num, 3))
-        uavs_pos[:, 0] = center[0] + r_uav * np.cos(theta_uav)
-        uavs_pos[:, 1] = center[1] + r_uav * np.sin(theta_uav)
-        uavs_pos[:, 2] = uav_height
-
         r_cu = radius * np.sqrt(np.random.rand(cus_num))
         theta_cu = np.random.rand(cus_num) * 2 * np.pi
         cus_pos = np.zeros((cus_num, 3))
@@ -309,6 +399,15 @@ class MyEnv(gym.Env):
         targets_pos = np.zeros((targets_num, 3))
         targets_pos[:, 0] = center[0] + r_target * np.cos(theta_target)
         targets_pos[:, 1] = center[1] + r_target * np.sin(theta_target)
+
+        initial_target_indices = np.random.choice(
+            targets_num,
+            size=uavs_num,
+            replace=targets_num < uavs_num
+        )
+        uavs_pos = np.zeros((uavs_num, 3))
+        uavs_pos[:, :2] = targets_pos[initial_target_indices, :2]
+        uavs_pos[:, 2] = uav_height
 
         return uavs_pos, cus_pos, targets_pos
 
