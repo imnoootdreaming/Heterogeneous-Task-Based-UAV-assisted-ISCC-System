@@ -89,6 +89,8 @@ def get_base_args():
                              help="强度参数")
     base_parser.add_argument("--solver_backend", type=str, default="fusion", choices=["fusion", "cvxpy"],
                              help="是否采用 Fusion 求解器，默认为 True（使用 Mosek Fusion），否则使用 CVXPY（默认使用 Mosek 作为 CVXPY 的求解器）")
+    base_parser.add_argument("--enable_initial_anchor", type=lambda x: str(x).lower() == "true", default=False,
+                             help="是否启用初始化描点/锚点可行性检查，默认为 False")
     return base_parser.parse_args()
 
 
@@ -397,15 +399,15 @@ def compute_uav_pos_cur(args, uavs_pos_pre):
     # 速度向量 v = [vx, vy, vz], |v| = speed
     # q(t+1) = q(t) + v * tau
     
-    # 1. 固定速度大小
-    fixed_speed = (args.uav_min_speed + args.uav_max_speed) / 2
+    # 1. 速度大小
+    uav_speed_magnitude = np.random.uniform(args.uav_min_speed, args.uav_max_speed, args.uavs_num)
 
-    # 2. 只生成 xy 方向随机单位向量
+    # 2. 只生成 xy 方向
     random_direction_xy = np.random.randn(args.uavs_num, 2)
     random_direction_xy /= np.linalg.norm(random_direction_xy, axis=1, keepdims=True)
 
     # 3. 位移（只在 xy）
-    displacement_xy = random_direction_xy * fixed_speed * args.time_slot_duration
+    displacement_xy = random_direction_xy * uav_speed_magnitude[:, np.newaxis] * args.time_slot_duration
 
     # 4. 拼成 3D 位移（z=0）
     displacement = np.zeros_like(uavs_pos_pre)
@@ -1545,6 +1547,22 @@ def _build_penalty_solution_payload(uavs_sen_beams=None,
     }
 
 
+def _is_initial_anchor_enabled(args):
+    return bool(getattr(args, "enable_initial_anchor", False))
+
+
+def _build_fixed_anchor_from_hat_parameters(hat_uav_sen_beams,
+                                            hat_uav_off_beams,
+                                            hat_bs_2_uav_freqs_norm,
+                                            hat_auxiliary_variable_z):
+    return {
+        "uavs_sen_beams": [np.array(param.value, copy=True) for param in hat_uav_sen_beams],
+        "uavs_off_beams": [np.array(param.value, copy=True) for param in hat_uav_off_beams],
+        "bs_2_uav_freqs_norm": np.array(hat_bs_2_uav_freqs_norm.value, copy=True),
+        "auxiliary_variable_z": np.array(hat_auxiliary_variable_z.value, copy=True),
+    }
+
+
 def _format_penalty_cccp_return(return_values, return_solution=False, solution_payload=None):
     if return_solution:
         return (*return_values, solution_payload)
@@ -1891,12 +1909,12 @@ def solve_initial_anchor_problem_with_fusion(args, active_groups, static_constra
                                              cur_penalty_factor, first_iter_rank_boost_lb,
                                              cus_entertaining_task_size, uavs_off_duration, cus_off_power,
                                              uavs_pos_pre, uavs_pos_cur, use_penalty_rank1):
-    fixed_anchor = {
-        "uavs_sen_beams": [np.array(param.value, copy=True) for param in hat_uav_sen_beams],
-        "uavs_off_beams": [np.array(param.value, copy=True) for param in hat_uav_off_beams],
-        "bs_2_uav_freqs_norm": np.array(hat_bs_2_uav_freqs_norm.value, copy=True),
-        "auxiliary_variable_z": np.array(hat_auxiliary_variable_z.value, copy=True),
-    }
+    fixed_anchor = _build_fixed_anchor_from_hat_parameters(
+        hat_uav_sen_beams=hat_uav_sen_beams,
+        hat_uav_off_beams=hat_uav_off_beams,
+        hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
+        hat_auxiliary_variable_z=hat_auxiliary_variable_z,
+    )
     return _solve_penalty_problem_with_fusion(
         args=args,
         active_groups=active_groups,
@@ -2027,116 +2045,116 @@ def penalty_based_cccp_fusion(args,
     final_solution_payload = None
 
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
-
-    init_problem_result = solve_initial_anchor_problem_with_fusion(
-        args=args,
-        active_groups=active_groups,
-        static_constraint_data=static_constraint_data,
-        hat_auxiliary_variable_z=hat_auxiliary_variable_z,
-        hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
-        hat_uav_sen_beams=hat_uav_sen_beams,
-        hat_uav_off_beams=hat_uav_off_beams,
-        rank1_sen_scaled_proj_mats=rank1_sen_scaled_proj_mats,
-        rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
-        rank1_const_terms=rank1_const_terms,
-        obj5_coef_z=obj5_coef_z,
-        obj5_coef_f=obj5_coef_f,
-        obj5_const_terms=obj5_const_terms,
-        c44_const_terms=c44_const_terms,
-        c44_grad_mats=c44_grad_mats,
-        c45_term4_const=c45_term4_const,
-        c45_term5_const=c45_term5_const,
-        c45_coef_w=c45_coef_w,
-        c45_coef_b=c45_coef_b,
-        c45_const_w=c45_const_w,
-        c45_const_b=c45_const_b,
-        cur_penalty_factor=cur_penalty_factor,
-        first_iter_rank_boost_lb=first_iter_rank_boost_lb,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur,
-        use_penalty_rank1=use_penalty_rank1,
-    )
-    if init_problem_result.get("failed", False):
-        per_uav_energy_list = [float("inf")] * args.uavs_num
-        original_obj_val_list.append(float("inf"))
-        energy_val_list.append(float("inf"))
-        rank1_sen_val_list.append(float("inf"))
-        rank1_off_val_list.append(float("inf"))
-        return _format_penalty_cccp_return(
-            (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
-            return_solution=return_solution,
-            solution_payload=final_solution_payload,
+    if _is_initial_anchor_enabled(args):
+        init_problem_result = solve_initial_anchor_problem_with_fusion(
+            args=args,
+            active_groups=active_groups,
+            static_constraint_data=static_constraint_data,
+            hat_auxiliary_variable_z=hat_auxiliary_variable_z,
+            hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
+            hat_uav_sen_beams=hat_uav_sen_beams,
+            hat_uav_off_beams=hat_uav_off_beams,
+            rank1_sen_scaled_proj_mats=rank1_sen_scaled_proj_mats,
+            rank1_off_scaled_proj_mats=rank1_off_scaled_proj_mats,
+            rank1_const_terms=rank1_const_terms,
+            obj5_coef_z=obj5_coef_z,
+            obj5_coef_f=obj5_coef_f,
+            obj5_const_terms=obj5_const_terms,
+            c44_const_terms=c44_const_terms,
+            c44_grad_mats=c44_grad_mats,
+            c45_term4_const=c45_term4_const,
+            c45_term5_const=c45_term5_const,
+            c45_coef_w=c45_coef_w,
+            c45_coef_b=c45_coef_b,
+            c45_const_w=c45_const_w,
+            c45_const_b=c45_const_b,
+            cur_penalty_factor=cur_penalty_factor,
+            first_iter_rank_boost_lb=first_iter_rank_boost_lb,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            use_penalty_rank1=use_penalty_rank1,
         )
+        if init_problem_result.get("failed", False):
+            per_uav_energy_list = [float("inf")] * args.uavs_num
+            original_obj_val_list.append(float("inf"))
+            energy_val_list.append(float("inf"))
+            rank1_sen_val_list.append(float("inf"))
+            rank1_off_val_list.append(float("inf"))
+            return _format_penalty_cccp_return(
+                (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+                return_solution=return_solution,
+                solution_payload=final_solution_payload,
+            )
 
-    init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
-    init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
-    init_uavs_off_beams = init_problem_result["uavs_off_beams"]
-    init_bs_2_uav_freqs_norm = init_problem_result["bs_2_uav_freqs_norm"]
-    init_auxiliary_variable_z = init_problem_result["auxiliary_variable_z"]
-    init_cus_off_duration = init_problem_result["cus_off_duration"]
-    init_original_obj_fun_val = compute_original_obj_fun_value(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        cur_cus_off_duration=init_cus_off_duration,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur,
-        cur_penalty_factor=cur_penalty_factor.value,
-        use_penalty_rank1=use_penalty_rank1
-    )
-    init_pure_energy_val = compute_pure_energy_value(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        cur_cus_off_duration=init_cus_off_duration,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur
-    )
-    per_uav_energy_list = compute_per_uav_total_energy_list(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        uavs_off_duration=uavs_off_duration,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur
-    )
-    rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
-    # print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
-    # print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
-    # print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
-    # print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
-    # print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
-    # print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
-    # print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
-    # print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
-    original_obj_val_list.append(init_original_obj_fun_val)
-    energy_val_list.append(init_pure_energy_val)
-    rank1_sen_val_list.append(init_rank1_sen_sum)
-    rank1_off_val_list.append(init_rank1_off_sum)
-    cur_original_obj_fun_val = init_original_obj_fun_val
-    obj_fun_opt = init_original_obj_fun_val
-    final_solution_payload = _build_penalty_solution_payload(
-        uavs_sen_beams=init_uavs_sen_beams,
-        uavs_off_beams=init_uavs_off_beams,
-        bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        auxiliary_variable_z=init_auxiliary_variable_z,
-        cus_off_duration=init_cus_off_duration,
-    )
+        init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
+        init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
+        init_uavs_off_beams = init_problem_result["uavs_off_beams"]
+        init_bs_2_uav_freqs_norm = init_problem_result["bs_2_uav_freqs_norm"]
+        init_auxiliary_variable_z = init_problem_result["auxiliary_variable_z"]
+        init_cus_off_duration = init_problem_result["cus_off_duration"]
+        init_original_obj_fun_val = compute_original_obj_fun_value(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            cur_cus_off_duration=init_cus_off_duration,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            cur_penalty_factor=cur_penalty_factor.value,
+            use_penalty_rank1=use_penalty_rank1
+        )
+        init_pure_energy_val = compute_pure_energy_value(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            cur_cus_off_duration=init_cus_off_duration,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur
+        )
+        per_uav_energy_list = compute_per_uav_total_energy_list(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            uavs_off_duration=uavs_off_duration,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur
+        )
+        rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
+        # print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
+        # print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
+        # print(f"第 0 轮 纯能量消耗: {init_pure_energy_val}")
+        # print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
+        # print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
+        # print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
+        # print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
+        # print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
+        original_obj_val_list.append(init_original_obj_fun_val)
+        energy_val_list.append(init_pure_energy_val)
+        rank1_sen_val_list.append(init_rank1_sen_sum)
+        rank1_off_val_list.append(init_rank1_off_sum)
+        cur_original_obj_fun_val = init_original_obj_fun_val
+        obj_fun_opt = init_original_obj_fun_val
+        final_solution_payload = _build_penalty_solution_payload(
+            uavs_sen_beams=init_uavs_sen_beams,
+            uavs_off_beams=init_uavs_off_beams,
+            bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            auxiliary_variable_z=init_auxiliary_variable_z,
+            cus_off_duration=init_cus_off_duration,
+        )
 
     for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
@@ -2539,100 +2557,100 @@ def penalty_based_cccp(args,
     cur_original_obj_fun_val = float('inf')
     final_solution_payload = None
     outer_iterations, inner_iterations = _get_iteration_schedule(args, fixed_total_iterations)
-
-    init_problem_result = solve_initial_anchor_problem_with_cvxpy(
-        args=args,
-        obj_fun=obj_fun,
-        constraints=constraints,
-        var_uavs_sen_beam=var_uavs_sen_beam,
-        var_uavs_off_beam=var_uavs_off_beam,
-        var_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm,
-        var_auxiliary_variable_z=var_auxiliary_variable_z,
-        var_cus_off_duration=var_cus_off_duration,
-        var_t=var_t,
-        hat_uav_sen_beams=hat_uav_sen_beams,
-        hat_uav_off_beams=hat_uav_off_beams,
-        hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
-        hat_auxiliary_variable_z=hat_auxiliary_variable_z,
-    )
-    if init_problem_result["status"] not in ("optimal", "optimal_inaccurate"):
-        print(f"Initial anchor subproblem failed with status: {init_problem_result['status']}")
-        original_obj_val_list.append(float("inf"))
-        energy_val_list.append(float("inf"))
-        rank1_sen_val_list.append(float("inf"))
-        rank1_off_val_list.append(float("inf"))
-        per_uav_energy_list = [float("inf")] * args.uavs_num
-        return _format_penalty_cccp_return(
-            (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
-            return_solution=return_solution,
-            solution_payload=final_solution_payload,
+    if _is_initial_anchor_enabled(args):
+        init_problem_result = solve_initial_anchor_problem_with_cvxpy(
+            args=args,
+            obj_fun=obj_fun,
+            constraints=constraints,
+            var_uavs_sen_beam=var_uavs_sen_beam,
+            var_uavs_off_beam=var_uavs_off_beam,
+            var_bs_2_uav_freqs_norm=var_bs_2_uav_freqs_norm,
+            var_auxiliary_variable_z=var_auxiliary_variable_z,
+            var_cus_off_duration=var_cus_off_duration,
+            var_t=var_t,
+            hat_uav_sen_beams=hat_uav_sen_beams,
+            hat_uav_off_beams=hat_uav_off_beams,
+            hat_bs_2_uav_freqs_norm=hat_bs_2_uav_freqs_norm,
+            hat_auxiliary_variable_z=hat_auxiliary_variable_z,
         )
+        if init_problem_result["status"] not in ("optimal", "optimal_inaccurate"):
+            print(f"Initial anchor subproblem failed with status: {init_problem_result['status']}")
+            original_obj_val_list.append(float("inf"))
+            energy_val_list.append(float("inf"))
+            rank1_sen_val_list.append(float("inf"))
+            rank1_off_val_list.append(float("inf"))
+            per_uav_energy_list = [float("inf")] * args.uavs_num
+            return _format_penalty_cccp_return(
+                (float("inf"), iter_count, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list),
+                return_solution=return_solution,
+                solution_payload=final_solution_payload,
+            )
 
-    init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
-    init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
-    init_uavs_off_beams = init_problem_result["uavs_off_beams"]
-    init_bs_2_uav_freqs_norm = init_problem_result["bs_2_uav_freqs_norm"]
-    init_auxiliary_variable_z = init_problem_result["auxiliary_variable_z"]
-    init_cus_off_duration = init_problem_result["cus_off_duration"]
-    init_original_obj_fun_val = compute_original_obj_fun_value(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        cur_cus_off_duration=init_cus_off_duration,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur,
-        cur_penalty_factor=cur_penalty_factor.value,
-        use_penalty_rank1=use_penalty_rank1
-    )
-    init_pure_energy_val = compute_pure_energy_value(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        cur_cus_off_duration=init_cus_off_duration,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur
-    )
-    per_uav_energy_list = compute_per_uav_total_energy_list(
-        args=args,
-        cur_uavs_sen_beams=init_uavs_sen_beams,
-        cur_uavs_off_beams=init_uavs_off_beams,
-        cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        cur_auxiliary_variable_z=init_auxiliary_variable_z,
-        uavs_off_duration=uavs_off_duration,
-        uavs_pos_pre=uavs_pos_pre,
-        uavs_pos_cur=uavs_pos_cur
-    )
-    rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
-    print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
-    print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
-    print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
-    print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
-    print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
-    print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
-    print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
-    original_obj_val_list.append(init_original_obj_fun_val)
-    energy_val_list.append(init_pure_energy_val)
-    rank1_sen_val_list.append(init_rank1_sen_sum)
-    rank1_off_val_list.append(init_rank1_off_sum)
-    cur_original_obj_fun_val = init_original_obj_fun_val
-    obj_fun_opt = init_original_obj_fun_val
-    final_solution_payload = _build_penalty_solution_payload(
-        uavs_sen_beams=init_uavs_sen_beams,
-        uavs_off_beams=init_uavs_off_beams,
-        bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
-        auxiliary_variable_z=init_auxiliary_variable_z,
-        cus_off_duration=init_cus_off_duration,
-    )
+        init_surrogate_opt_val = float(np.real(init_problem_result["objective_value"]))
+        init_uavs_sen_beams = init_problem_result["uavs_sen_beams"]
+        init_uavs_off_beams = init_problem_result["uavs_off_beams"]
+        init_bs_2_uav_freqs_norm = init_problem_result["bs_2_uav_freqs_norm"]
+        init_auxiliary_variable_z = init_problem_result["auxiliary_variable_z"]
+        init_cus_off_duration = init_problem_result["cus_off_duration"]
+        init_original_obj_fun_val = compute_original_obj_fun_value(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            cur_cus_off_duration=init_cus_off_duration,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur,
+            cur_penalty_factor=cur_penalty_factor.value,
+            use_penalty_rank1=use_penalty_rank1
+        )
+        init_pure_energy_val = compute_pure_energy_value(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            cur_cus_off_duration=init_cus_off_duration,
+            cus_entertaining_task_size=cus_entertaining_task_size,
+            uavs_off_duration=uavs_off_duration,
+            cus_off_power=cus_off_power,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur
+        )
+        per_uav_energy_list = compute_per_uav_total_energy_list(
+            args=args,
+            cur_uavs_sen_beams=init_uavs_sen_beams,
+            cur_uavs_off_beams=init_uavs_off_beams,
+            cur_bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            cur_auxiliary_variable_z=init_auxiliary_variable_z,
+            uavs_off_duration=uavs_off_duration,
+            uavs_pos_pre=uavs_pos_pre,
+            uavs_pos_cur=uavs_pos_cur
+        )
+        rank1_gap_max, init_rank1_sum, init_rank1_sen_sum, init_rank1_off_sum = _compute_rank1_gap_metrics(init_uavs_sen_beams, init_uavs_off_beams)
+        print(f"第 0 轮 目标函数值 : {init_problem_result['objective_value']}")
+        print(f"第 0 轮 原始目标函数值 {init_original_obj_fun_val}")
+        print(f"第 0 轮线性化子问题曲线 {init_surrogate_opt_val}")
+        print(f"第 0 轮 最大rank1 gap: {rank1_gap_max}")
+        print(f"第 0 轮 rank1 gap 总和: {init_rank1_sum}")
+        print(f"第 0 轮 w_gap 总和: {init_rank1_sen_sum}")
+        print(f"第 0 轮 b_gap 总和: {init_rank1_off_sum}")
+        original_obj_val_list.append(init_original_obj_fun_val)
+        energy_val_list.append(init_pure_energy_val)
+        rank1_sen_val_list.append(init_rank1_sen_sum)
+        rank1_off_val_list.append(init_rank1_off_sum)
+        cur_original_obj_fun_val = init_original_obj_fun_val
+        obj_fun_opt = init_original_obj_fun_val
+        final_solution_payload = _build_penalty_solution_payload(
+            uavs_sen_beams=init_uavs_sen_beams,
+            uavs_off_beams=init_uavs_off_beams,
+            bs_2_uav_freqs_norm=init_bs_2_uav_freqs_norm,
+            auxiliary_variable_z=init_auxiliary_variable_z,
+            cus_off_duration=init_cus_off_duration,
+        )
 
     for outer_iter in range(outer_iterations):
         pre_original_obj_fun_val = float('inf')
@@ -2819,7 +2837,7 @@ def generate_rho_sweep_energy_csv(args,
                                   csv_prefix=None):
     """
     固定执行 fixed_total_iterations 次正式 CCCP 更新，比较不同 rho 对能耗收敛曲线的影响，并导出 energy CSV。
-    导出的曲线包含额外的初始化锚点求解结果，因此总点数为 fixed_total_iterations + 1。
+    若启用初始化描点，则导出的曲线包含额外的初始化锚点求解结果。
     该函数不会触发提前收敛判断，也不会修改传入 args 的原始内容。
     """
     if rho_values is None:
@@ -2959,7 +2977,6 @@ def generate_random_case_convergence_csv(args,
             if (not np.isfinite(objective_value)) or (not np.isfinite(iter_count)):
                 print("当前 case 求解结果为 INF，已丢弃并重新生成新的 case。")
                 continue
-            print(f"当前 case 求解结果的目标函数值: {objective_value}, 收敛迭代次数: {iter_count}")
 
             accepted_case_count += 1
             results.append({
@@ -3006,7 +3023,7 @@ def db_2_watt(db):
 if __name__ == "__main__":
     # 获取参数
     args = get_base_args()
-    # np.random.seed(args.seed)  # 确保仿真结果可复现
+    np.random.seed(args.seed)  # 确保仿真结果可复现
     
     uavs_pos, cus_pos, targets_pos = generate_pos(
         uavs_num=args.uavs_num, cus_num=args.cus_num, targets_num=args.targets_num,
@@ -3036,8 +3053,51 @@ if __name__ == "__main__":
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
     
-    # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    # energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
+    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
+    energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
+        args=args,
+        uavs_2_cus_channels=uavs_2_cus_channels,
+        uavs_2_bs_channels=uavs_2_bs_channels,
+        cus_2_bs_channels=cus_2_bs_channels,
+        uavs_2_targets_channels=uavs_2_targets_channels,
+        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+        uavs_pos_pre=uavs_pos,
+        uavs_pos_cur=uavs_pos_cur,
+        uavs_off_duration=uavs_off_duration,
+        cus_off_power=cus_off_power,
+        use_penalty_rank1=True,
+        cus_entertaining_task_size=cus_entertaining_task_size,
+        return_solution=True,
+    )
+    # if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
+    #     beam_pattern_save_path = os.path.join(
+    #         os.path.dirname(os.path.abspath(__file__)),
+    #         f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
+    #     )
+    #     plot_uav_sensing_beam_patterns(
+    #         args=args,
+    #         uavs_sen_beams=final_solution["uavs_sen_beams"],
+    #         uavs_pos=uavs_pos,
+    #         targets_pos=targets_pos,
+    #         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #         save_path=beam_pattern_save_path,
+    #     )
+    with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(original_obj_val_list)
+    with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(energy_val_list)
+    with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(rank1_sen_val_list)
+    with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(rank1_off_val_list)
+
+    # # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
+    # generate_rho_sweep_energy_csv(
     #     args=args,
     #     uavs_2_cus_channels=uavs_2_cus_channels,
     #     uavs_2_bs_channels=uavs_2_bs_channels,
@@ -3051,21 +3111,8 @@ if __name__ == "__main__":
     #     cus_off_power=cus_off_power,
     #     use_penalty_rank1=True,
     #     cus_entertaining_task_size=cus_entertaining_task_size,
-    #     return_solution=True,
     # )
-    # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(original_obj_val_list)
-    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(energy_val_list)
-    # with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(rank1_sen_val_list)
-    # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow(rank1_off_val_list)
 
-    # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
-    random_case_csv_path = generate_random_case_convergence_csv(args=args)
-    print(f"随机 case 收敛次数 CSV 已保存到: {random_case_csv_path}")
+    # # NOTE - 随机 30 个 case 的收敛次数统计并导出 CSV
+    # random_case_csv_path = generate_random_case_convergence_csv(args=args)
+    # print(f"随机 case 收敛次数 CSV 已保存到: {random_case_csv_path}")

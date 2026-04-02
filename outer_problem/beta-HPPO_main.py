@@ -41,7 +41,7 @@ def get_madrl_args():
     madrl_parser.add_argument("--epochs", type=int, default=10, help="每次更新迭代次数")
     madrl_parser.add_argument("--total_time_slots", type=int, default=30, help="总时隙数量")
     madrl_parser.add_argument("--hidden_dim", type=int, default=128, help="隐藏层维度")
-    madrl_parser.add_argument("--episodes", type=int, default=2000, help="迭代轮次")
+    madrl_parser.add_argument("--episodes", type=int, default=5000, help="迭代轮次")
     return madrl_parser.parse_args()
 
 
@@ -104,9 +104,9 @@ def get_base_args():
     base_parser.add_argument("--radar_spectrum_shape", type=float, default=pi / sqrt(3), help="雷达频谱形状参数")
 
     # 基于惩罚的 CCCP 算法参数
-    base_parser.add_argument("--max_iterations", type=int, default=5, help="CCCP 算法最大迭代次数")
-    base_parser.add_argument("--cccp_threshold", type=float, default=1e-3, help="CCCP 算法目标函数收敛阈值")
-    base_parser.add_argument("--rank1_threshold", type=float, default=1e-3, help="CCCP 算法秩一约束收敛阈值")
+    base_parser.add_argument("--max_iterations", type=int, default=10, help="CCCP 算法最大迭代次数")
+    base_parser.add_argument("--cccp_threshold", type=float, default=1e-4, help="CCCP 算法目标函数收敛阈值")
+    base_parser.add_argument("--rank1_threshold", type=float, default=1e-4, help="CCCP 算法秩一约束收敛阈值")
     base_parser.add_argument("--penalty_factor", type=float, default=0.1, help="罚因子")
     base_parser.add_argument("--zoom_factor", type=float, default=2, help="缩放系数")
     base_parser.add_argument("--enable_cccp_diagnostics", default="True", help="启用 CCCP 诊断，检查下一轮线性化后的贴合性和可行性")
@@ -122,6 +122,8 @@ def get_base_args():
                              help="强度参数")
     base_parser.add_argument("--solver_backend", type=str, default="fusion", choices=["fusion", "cvxpy"],
                              help="是否采用 Fusion 求解器，默认为 True（使用 Mosek Fusion），否则使用 CVXPY（默认使用 Mosek 作为 CVXPY 的求解器）")
+    base_parser.add_argument("--enable_initial_anchor", type=lambda x: str(x).lower() == "true", default=False,
+                             help="是否启用初始化描点/锚点可行性检查，默认为 False")
     
     return base_parser.parse_args()
 
