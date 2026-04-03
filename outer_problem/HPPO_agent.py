@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Beta, Categorical
+from torch.distributions import Beta, Categorical, Normal
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
 
@@ -25,8 +25,24 @@ class BetaHead(nn.Module):
         return Beta(alpha, beta)
 
 
+class GaussianHead(nn.Module):
+    # 20260403 - 引入高斯分布对应的修改
+    def __init__(self, hidden_dim, action_dim):
+        super(GaussianHead, self).__init__()
+        self.mean_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+        orthogonal_init(self.mean_layer, gain=0.01)
+        orthogonal_init(self.log_std_layer, gain=0.01)
+
+    def get_dist(self, features):
+        mean = self.mean_layer(features)
+        log_std = torch.clamp(self.log_std_layer(features), min=-20.0, max=2.0)
+        std = torch.exp(log_std)
+        return Normal(mean, std)
+
+
 class MultiHeadActor(nn.Module):
-    def __init__(self, state_dim, hidden_dim, continuous_action_splits, discrete_action_dims):
+    def __init__(self, state_dim, hidden_dim, continuous_action_splits, discrete_action_dims, continuous_dist_type="beta"):
         super(MultiHeadActor, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -37,10 +53,20 @@ class MultiHeadActor(nn.Module):
 
         self.continuous_action_splits = continuous_action_splits
         self.continuous_head_names = list(continuous_action_splits.keys())
-        self.continuous_heads = nn.ModuleDict({
-            head_name: BetaHead(hidden_dim, head_dim)
-            for head_name, head_dim in continuous_action_splits.items()
-        })
+        # 20260403 - 引入高斯分布对应的修改
+        self.continuous_dist_type = str(continuous_dist_type).lower()
+        if self.continuous_dist_type == "beta":
+            self.continuous_heads = nn.ModuleDict({
+                head_name: BetaHead(hidden_dim, head_dim)
+                for head_name, head_dim in continuous_action_splits.items()
+            })
+        elif self.continuous_dist_type == "gaussian":
+            self.continuous_heads = nn.ModuleDict({
+                head_name: GaussianHead(hidden_dim, head_dim)
+                for head_name, head_dim in continuous_action_splits.items()
+            })
+        else:
+            raise ValueError(f"Unsupported continuous_dist_type: {continuous_dist_type}")
 
         self.discrete_action_dims = [int(dim) for dim in discrete_action_dims]
         # NOTE - Each discrete head corresponds to one UAV choosing one CU index.
@@ -69,6 +95,41 @@ class MultiHeadActor(nn.Module):
         ]
         return continuous_dists, discrete_dists
 
+    # 20260403 - 引入高斯分布对应的修改
+    def _sample_continuous_action_and_log_prob(self, dist):
+        if self.continuous_dist_type == "beta":
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
+            return action, log_prob, entropy
+
+        if self.continuous_dist_type == "gaussian":
+            raw_action = dist.rsample()
+            action = torch.sigmoid(raw_action)
+            log_prob = dist.log_prob(raw_action) - torch.log(action * (1.0 - action) + 1e-8)
+            log_prob = log_prob.sum(dim=-1, keepdim=True)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
+            return action, log_prob, entropy
+
+        raise ValueError(f"Unsupported continuous_dist_type: {self.continuous_dist_type}")
+
+    # 20260403 - 引入高斯分布对应的修改
+    def _evaluate_continuous_log_prob_and_entropy(self, dist, action_slice):
+        if self.continuous_dist_type == "beta":
+            log_prob = dist.log_prob(action_slice).sum(dim=-1, keepdim=True)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
+            return log_prob, entropy
+
+        if self.continuous_dist_type == "gaussian":
+            action_slice = torch.clamp(action_slice, 1e-6, 1.0 - 1e-6)
+            raw_action = torch.logit(action_slice, eps=1e-6)
+            log_prob = dist.log_prob(raw_action) - torch.log(action_slice * (1.0 - action_slice) + 1e-8)
+            log_prob = log_prob.sum(dim=-1, keepdim=True)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
+            return log_prob, entropy
+
+        raise ValueError(f"Unsupported continuous_dist_type: {self.continuous_dist_type}")
+
     def sample(self, s):
         continuous_dists, discrete_dists = self._get_dists(s)
         batch_size = s.size(0)
@@ -79,10 +140,10 @@ class MultiHeadActor(nn.Module):
         con_log_prob = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
         for head_name in self.continuous_head_names:
             dist = continuous_dists[head_name]
-            action = dist.sample()
+            action, action_log_prob, _ = self._sample_continuous_action_and_log_prob(dist)
             continuous_actions.append(action)
-            total_log_prob = total_log_prob + dist.log_prob(action).sum(dim=-1, keepdim=True)
-            con_log_prob = con_log_prob + dist.log_prob(action).sum(dim=-1, keepdim=True)
+            total_log_prob = total_log_prob + action_log_prob
+            con_log_prob = con_log_prob + action_log_prob
 
         if continuous_actions:
             continuous_actions = torch.cat(continuous_actions, dim=-1)
@@ -120,8 +181,9 @@ class MultiHeadActor(nn.Module):
             head_dim = self.continuous_action_splits[head_name]
             action_slice = continuous_actions[:, start_idx:start_idx + head_dim]
             dist = continuous_dists[head_name]
-            cont_log_prob += dist.log_prob(action_slice).sum(dim=-1, keepdim=True)
-            cont_entropy += dist.entropy().sum(dim=-1, keepdim=True)
+            head_log_prob, head_entropy = self._evaluate_continuous_log_prob_and_entropy(dist, action_slice)
+            cont_log_prob += head_log_prob
+            cont_entropy += head_entropy
             start_idx += head_dim
 
         for head_idx, dist in enumerate(discrete_dists):
@@ -154,14 +216,16 @@ class Critic(nn.Module):
 class HPPO:
     def __init__(self, state_dim, hidden_dim, continuous_action_splits, discrete_action_dims,
                  action_low, action_high, actor_lr, critic_lr, lmbda, eps, gamma, epochs,
-                 num_episodes, device, entropy_coef=0.01, discrete_entropy_coef=0.01, continuous_entropy_coef=0.05):
+                 num_episodes, device, entropy_coef=0.01, discrete_entropy_coef=0.01,
+                 continuous_entropy_coef=0.05, continuous_dist_type="beta"):
         self.continuous_action_splits = continuous_action_splits
         self.discrete_action_dims = np.asarray(discrete_action_dims, dtype=np.int64)
         self.actor = MultiHeadActor(
             state_dim=state_dim,
             hidden_dim=hidden_dim,
             continuous_action_splits=continuous_action_splits,
-            discrete_action_dims=self.discrete_action_dims
+            discrete_action_dims=self.discrete_action_dims,
+            continuous_dist_type=continuous_dist_type
         ).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
 

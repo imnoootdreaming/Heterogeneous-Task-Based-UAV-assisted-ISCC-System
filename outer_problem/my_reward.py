@@ -58,7 +58,7 @@ class MyReward:
         if energy_opt == float("inf"):
             no_solution_penalty = 1
 
-        total_reward_4_energy = np.exp(-energy_opt / 100)
+        total_reward_4_energy = np.exp(-energy_opt / 1000)
         total_reward = (
             total_reward_4_energy
             - bs_alloc_spectrum_penalty
