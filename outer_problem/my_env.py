@@ -39,6 +39,8 @@ class MyEnv(gym.Env):
         self.cur_uavs_pos = self.init_uavs_pos.copy()
         self.precomputed_cus_traj = self.generate_cu_trajectory()
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()
+        # 20260404 - NLoS 分量: 预生成每个时隙的高斯散射分量，保证不同 episode 的相同时隙复用同一 realization
+        self.precomputed_nlos_components = self._precompute_nlos_components()
 
         self.precomputed_uav_target_schedule, self.precomputed_uav_target_schedule_distances = self.generate_uav_target_schedule()
         self._print_precomputed_target_schedule(
@@ -113,7 +115,32 @@ class MyEnv(gym.Env):
 
         self.reward_calculator = MyReward(self.base_args)
 
+    def _precompute_nlos_components(self):
+        # 20260404 - NLoS 分量: 以固定 seed 按时隙预生成通信链路的 NLoS 高斯样本
+        total_slots = self.madrl_args.total_time_slots + 1
+        rng = np.random.default_rng(self.base_args.seed)
+        return {
+            "uavs_2_cus": (
+                rng.standard_normal((total_slots, self.base_args.uavs_num, self.base_args.cus_num, self.base_args.antenna_nums))
+                + 1j * rng.standard_normal((total_slots, self.base_args.uavs_num, self.base_args.cus_num, self.base_args.antenna_nums))
+            ) / np.sqrt(2),
+            "uavs_2_bs": (
+                rng.standard_normal((total_slots, self.base_args.uavs_num, 1, self.base_args.antenna_nums))
+                + 1j * rng.standard_normal((total_slots, self.base_args.uavs_num, 1, self.base_args.antenna_nums))
+            ) / np.sqrt(2),
+            "cus_2_bs": (
+                rng.standard_normal((total_slots, self.base_args.cus_num, 1))
+                + 1j * rng.standard_normal((total_slots, self.base_args.cus_num, 1))
+            ) / np.sqrt(2),
+        }
+
     def _refresh_channels(self):
+        # 20260404 - NLoS 分量: 当前时隙固定使用预生成的 NLoS 样本
+        slot_nlos = {
+            "uavs_2_cus": self.precomputed_nlos_components["uavs_2_cus"][self.t],
+            "uavs_2_bs": self.precomputed_nlos_components["uavs_2_bs"][self.t],
+            "cus_2_bs": self.precomputed_nlos_components["cus_2_bs"][self.t],
+        }
         self.uavs_2_cus_channels, self.uavs_2_bs_channels, self.cus_2_bs_channels = self.compute_com_channel_gain(
             uavs_pos=self.cur_uavs_pos,
             cus_pos=self.cur_cus_pos,
@@ -122,7 +149,8 @@ class MyEnv(gym.Env):
             alpha_uav_link=self.base_args.alpha_uav_link,
             alpha_cu_link=self.base_args.alpha_cu_link,
             rician_factor=db_2_watt(self.base_args.rician_factor_db),
-            antenna_nums=self.base_args.antenna_nums
+            antenna_nums=self.base_args.antenna_nums,
+            nlos_components=slot_nlos
         )
         self.uavs_2_targets_channels = self.compute_sen_channel_gain(
             radar_rcs=self.base_args.radar_rcs,
@@ -412,10 +440,11 @@ class MyEnv(gym.Env):
         return uavs_pos, cus_pos, targets_pos
 
     def compute_com_channel_gain(self, uavs_pos, cus_pos, ref_path_loss, frac_d_lambda,
-                                 alpha_uav_link, alpha_cu_link, rician_factor, antenna_nums):
+                                 alpha_uav_link, alpha_cu_link, rician_factor, antenna_nums,
+                                 nlos_components=None):
         bs_pos = np.array([0, 0, 0])
 
-        def get_rician_channel(pos1, pos2, alpha, K, is_mimo=True):
+        def get_rician_channel(pos1, pos2, alpha, K, is_mimo=True, nlos_component=None):
             diff = pos1[:, np.newaxis, :] - pos2[np.newaxis, :, :]
             dist = np.linalg.norm(diff, axis=2)
             path_loss = ref_path_loss * (dist ** -alpha)
@@ -427,24 +456,42 @@ class MyEnv(gym.Env):
                 n_range = np.arange(antenna_nums)
                 exponent = 1j * 2 * np.pi * frac_d_lambda * np.sin(phi)[..., np.newaxis] * n_range
                 h_los = np.exp(exponent)
-                h_nlos = (
-                    np.random.randn(*dist.shape, antenna_nums)
-                    + 1j * np.random.randn(*dist.shape, antenna_nums)
-                ) / np.sqrt(2)
+                # 20260404 - NLoS 分量: 优先复用预生成的时隙级高斯样本，仅在未提供时退回在线采样
+                if nlos_component is None:
+                    h_nlos = (
+                        np.random.randn(*dist.shape, antenna_nums)
+                        + 1j * np.random.randn(*dist.shape, antenna_nums)
+                    ) / np.sqrt(2)
+                else:
+                    h_nlos = nlos_component
                 path_loss_expanded = path_loss[..., np.newaxis]
                 h = np.sqrt(path_loss_expanded) * (
                     np.sqrt(K / (K + 1)) * h_los + np.sqrt(1 / (K + 1)) * h_nlos
                 )
             else:
-                h_nlos = (np.random.randn(*dist.shape) + 1j * np.random.randn(*dist.shape)) / np.sqrt(2)
+                # 20260404 - NLoS 分量: 优先复用预生成的时隙级高斯样本，仅在未提供时退回在线采样
+                if nlos_component is None:
+                    h_nlos = (np.random.randn(*dist.shape) + 1j * np.random.randn(*dist.shape)) / np.sqrt(2)
+                else:
+                    h_nlos = nlos_component
                 h = np.sqrt(path_loss) * (
                     np.sqrt(K / (K + 1)) * 1.0 + np.sqrt(1 / (K + 1)) * h_nlos
                 )
             return h
 
-        uavs_2_cus_channels = get_rician_channel(uavs_pos, cus_pos, alpha_uav_link, rician_factor, is_mimo=True)
-        uavs_2_bs_channels = get_rician_channel(uavs_pos, bs_pos[np.newaxis, :], alpha_uav_link, rician_factor, is_mimo=True)
-        cus_2_bs_channels = get_rician_channel(cus_pos, bs_pos[np.newaxis, :], alpha_cu_link, rician_factor, is_mimo=False)
+        uavs_2_cus_nlos = None if nlos_components is None else nlos_components.get("uavs_2_cus")
+        uavs_2_bs_nlos = None if nlos_components is None else nlos_components.get("uavs_2_bs")
+        cus_2_bs_nlos = None if nlos_components is None else nlos_components.get("cus_2_bs")
+
+        uavs_2_cus_channels = get_rician_channel(
+            uavs_pos, cus_pos, alpha_uav_link, rician_factor, is_mimo=True, nlos_component=uavs_2_cus_nlos
+        )
+        uavs_2_bs_channels = get_rician_channel(
+            uavs_pos, bs_pos[np.newaxis, :], alpha_uav_link, rician_factor, is_mimo=True, nlos_component=uavs_2_bs_nlos
+        )
+        cus_2_bs_channels = get_rician_channel(
+            cus_pos, bs_pos[np.newaxis, :], alpha_cu_link, rician_factor, is_mimo=False, nlos_component=cus_2_bs_nlos
+        )
         return uavs_2_cus_channels, uavs_2_bs_channels, cus_2_bs_channels
 
     def compute_sen_channel_gain(self, radar_rcs, frac_d_lambda, uavs_pos, targets_pos, antenna_nums, ref_path_loss):
