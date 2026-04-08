@@ -108,8 +108,9 @@ class MyEnv(gym.Env):
             + self.base_args.cus_num * 2
             + self.base_args.targets_num * 3
             + self.base_args.uavs_num * 3
-            # 20260406 - BS 观测空间修改: 增加当前时隙 t 和当前 UAV-Target 匹配矩阵
+            #20260408 - 观测空间修改 : 加入下一个窗口感知目标和切换倒计时
             + 1
+            + self.base_args.uavs_num * self.base_args.targets_num
             + self.base_args.uavs_num * self.base_args.targets_num
         )
         self.observation_space = {
@@ -170,13 +171,38 @@ class MyEnv(gym.Env):
     def _get_all_target_coords(self):
         return self.init_targets_pos.astype(np.float32).flatten()
 
-    def _get_current_time_slot(self):
-        # 20260406 - BS 观测空间修改: 将当前时隙 t 纳入 BS 观测
-        return np.array([self.t], dtype=np.float32)
+    def _get_slots_until_switch(self):
+        #20260408 - 观测空间修改 : 加入下一个窗口感知目标和切换倒计时
+        effective_t = min(self.t, max(self.madrl_args.total_time_slots - 1, 0))
+        slots_until_switch = self.target_hold_slots - 1 - (effective_t % self.target_hold_slots)
+        return np.array([slots_until_switch], dtype=np.float32)
 
     def _get_current_uav_target_matching(self):
         # 20260406 - BS 观测空间修改: 将当前 uavs_targets_matched_matrix 纳入 BS 观测
         return self.uavs_targets_matched_matrix.astype(np.float32).flatten()
+
+    def _get_next_uav_target_matching(self):
+        #20260408 - 观测空间修改 : 加入下一个窗口感知目标和切换倒计时
+        if self.madrl_args.total_time_slots <= 0:
+            return self.uavs_targets_matched_matrix.astype(np.float32).flatten()
+        # 防止最后一个窗口的越界保护
+        effective_t = min(self.t, self.madrl_args.total_time_slots - 1)
+        # 计算总共有多少个目标分配窗口
+        num_windows = self._get_num_target_windows(
+            total_time_slots=self.madrl_args.total_time_slots,
+            hold_slots=self.target_hold_slots
+        )
+        # 计算当前时隙属于第几个窗口
+        current_window_idx = min(effective_t // self.target_hold_slots, num_windows - 1)
+        # 计算下一个窗口
+        next_window_idx = min(current_window_idx + 1, num_windows - 1)
+        # 计算下一个窗口从哪个时隙开始
+        next_window_start_slot = min(next_window_idx * self.target_hold_slots, self.madrl_args.total_time_slots)
+        # 转换为 one-hot 矩阵
+        next_window_matching = self.build_uav_targets_matched_matrix(
+            self.precomputed_uav_target_schedule[next_window_start_slot]
+        )
+        return next_window_matching.astype(np.float32).flatten()
 
     def _build_bs_observation(self):
         return np.concatenate([
@@ -185,9 +211,10 @@ class MyEnv(gym.Env):
             self._flatten_complex(self.cus_2_bs_channels),
             self._get_all_target_coords(),
             self.cur_uavs_pos.astype(np.float32).flatten(),
-            # 20260406 - BS 观测空间修改: 追加当前时隙 t 以及当前 UAV-Target 匹配矩阵
-            self._get_current_time_slot(),
+            #20260408 - 观测空间修改 : 加入下一个窗口感知目标和切换倒计时
+            self._get_slots_until_switch(),
             self._get_current_uav_target_matching(),
+            self._get_next_uav_target_matching(),
         ]).astype(np.float32)
 
     def _build_uavs_cus_matched_matrix(self, discrete_actions):
