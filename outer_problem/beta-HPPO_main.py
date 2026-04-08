@@ -189,6 +189,7 @@ if __name__ == "__main__":
             }
 
             s = env.reset()
+            state_bs_norm = running_norm_bs(np.array(s["bs"], dtype=np.float32))
             terminal = False
             uav_positions_episode = []
             cu_positions_episode = []
@@ -200,7 +201,6 @@ if __name__ == "__main__":
                 cu_positions_episode.append(env.getPosCU())
                 target_positions_episode.append(env.getPosTarget())
 
-                state_bs_norm = running_norm_bs(np.array(s["bs"], dtype=np.float32))
                 action_bs, old_log_probs_bs, old_con_log_probs_bs, old_dis_log_probs_bs = agent_bs.choose_action(state_bs_norm)
 
                 next_s, total_reward, r_dict, done = env.step({"bs": action_bs}, i_episode)
@@ -223,7 +223,7 @@ if __name__ == "__main__":
                 # NOTE - 调整了 real_dones，因为这是一个三十个时隙的感知任务
                 transition_dict_bs["real_dones"].append(bool(done))
                 
-                s = next_s
+                state_bs_norm = next_state_bs_norm
                 terminal = done
 
             if np.mean(episode_rewards_total) > max_avg_reward:
