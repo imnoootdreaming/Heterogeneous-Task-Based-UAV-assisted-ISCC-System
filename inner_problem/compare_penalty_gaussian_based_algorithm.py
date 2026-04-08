@@ -17,7 +17,7 @@ def get_base_args():
     base_parser = argparse.ArgumentParser(description="场景的基本参数")
 
     # 仿真场景参数
-    base_parser.add_argument("--num_cases", type=int, default=30, help="随机案例数量")
+    base_parser.add_argument("--num_cases", type=int, default=10, help="随机案例数量")
     base_parser.add_argument("--seed", type=int, default=42, help="随机种子")
     base_parser.add_argument("--targets_num", type=int, default=40, help="目标数量")
     base_parser.add_argument("--uavs_num", type=int, default=4, help="UAV 数量")

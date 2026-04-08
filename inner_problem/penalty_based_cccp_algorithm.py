@@ -3053,48 +3053,48 @@ if __name__ == "__main__":
     cus_entertaining_task_size = np.random.uniform(140e3, 200e3, args.cus_num)
     
     
-    # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
-    energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
-        args=args,
-        uavs_2_cus_channels=uavs_2_cus_channels,
-        uavs_2_bs_channels=uavs_2_bs_channels,
-        cus_2_bs_channels=cus_2_bs_channels,
-        uavs_2_targets_channels=uavs_2_targets_channels,
-        uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-        uavs_cus_matched_matrix=uavs_cus_matched_matrix,
-        uavs_pos_pre=uavs_pos,
-        uavs_pos_cur=uavs_pos_cur,
-        uavs_off_duration=uavs_off_duration,
-        cus_off_power=cus_off_power,
-        use_penalty_rank1=True,
-        cus_entertaining_task_size=cus_entertaining_task_size,
-        return_solution=True,
-    )
-    # if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
-    #     beam_pattern_save_path = os.path.join(
-    #         os.path.dirname(os.path.abspath(__file__)),
-    #         f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
-    #     )
-    #     plot_uav_sensing_beam_patterns(
-    #         args=args,
-    #         uavs_sen_beams=final_solution["uavs_sen_beams"],
-    #         uavs_pos=uavs_pos,
-    #         targets_pos=targets_pos,
-    #         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
-    #         save_path=beam_pattern_save_path,
-    #     )
-    with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(original_obj_val_list)
-    with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(energy_val_list)
-    with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(rank1_sen_val_list)
-    with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(rank1_off_val_list)
+    # # NOTE - 绘图1 - 固定 rho 下的能耗和 rank1 gap 收敛曲线
+    # energy_opt, _, original_obj_val_list, energy_val_list, rank1_sen_val_list, rank1_off_val_list, per_uav_energy_list, final_solution = penalty_based_cccp(
+    #     args=args,
+    #     uavs_2_cus_channels=uavs_2_cus_channels,
+    #     uavs_2_bs_channels=uavs_2_bs_channels,
+    #     cus_2_bs_channels=cus_2_bs_channels,
+    #     uavs_2_targets_channels=uavs_2_targets_channels,
+    #     uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    #     uavs_cus_matched_matrix=uavs_cus_matched_matrix,
+    #     uavs_pos_pre=uavs_pos,
+    #     uavs_pos_cur=uavs_pos_cur,
+    #     uavs_off_duration=uavs_off_duration,
+    #     cus_off_power=cus_off_power,
+    #     use_penalty_rank1=True,
+    #     cus_entertaining_task_size=cus_entertaining_task_size,
+    #     return_solution=True,
+    # )
+    # # if final_solution is not None and final_solution["uavs_sen_beams"] is not None:
+    # #     beam_pattern_save_path = os.path.join(
+    # #         os.path.dirname(os.path.abspath(__file__)),
+    # #         f"{date_str}_uav_sensing_beam_patterns_uav{args.uavs_num}.pdf",
+    # #     )
+    # #     plot_uav_sensing_beam_patterns(
+    # #         args=args,
+    # #         uavs_sen_beams=final_solution["uavs_sen_beams"],
+    # #         uavs_pos=uavs_pos,
+    # #         targets_pos=targets_pos,
+    # #         uavs_targets_matched_matrix=uavs_targets_matched_matrix,
+    # #         save_path=beam_pattern_save_path,
+    # #     )
+    # with open(f"{date_str}_objective_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(original_obj_val_list)
+    # with open(f"{date_str}_energy_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(energy_val_list)
+    # with open(f"{date_str}_rank1_sen_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_sen_val_list)
+    # with open(f"{date_str}_rank1_off_val_list_rho{args.penalty_factor}_uav{args.uavs_num}.csv", "w", newline="", encoding="utf-8") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(rank1_off_val_list)
 
     # # NOTE - 绘图2 - 不同 rho 下的能耗收敛曲线
     # generate_rho_sweep_energy_csv(
