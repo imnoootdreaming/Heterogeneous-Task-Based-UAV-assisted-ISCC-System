@@ -38,10 +38,10 @@ def get_madrl_args():
     madrl_parser.add_argument("--lmbda", type=float, default=0.95, help="GAE (lambda)")
     madrl_parser.add_argument("--eps", type=float, default=0.2, help="PPO 裁剪因子 (epsilon)")
     madrl_parser.add_argument("--gamma", type=float, default=0.99, help="折扣因子 (gamma)")
-    madrl_parser.add_argument("--epochs", type=int, default=10, help="每次更新迭代次数")
+    madrl_parser.add_argument("--epochs", type=int, default=5, help="每次更新迭代次数")
     madrl_parser.add_argument("--total_time_slots", type=int, default=40, help="总时隙数量")
     madrl_parser.add_argument("--hidden_dim", type=int, default=128, help="隐藏层维度")
-    madrl_parser.add_argument("--episodes", type=int, default=6000, help="迭代轮次")
+    madrl_parser.add_argument("--episodes", type=int, default=5000, help="迭代轮次")
     return madrl_parser.parse_args()
 
 
@@ -189,7 +189,6 @@ if __name__ == "__main__":
             }
 
             s = env.reset()
-            state_bs_norm = running_norm_bs(np.array(s["bs"], dtype=np.float32))
             terminal = False
             uav_positions_episode = []
             cu_positions_episode = []
@@ -201,6 +200,7 @@ if __name__ == "__main__":
                 cu_positions_episode.append(env.getPosCU())
                 target_positions_episode.append(env.getPosTarget())
 
+                state_bs_norm = running_norm_bs(np.array(s["bs"], dtype=np.float32))
                 action_bs, old_log_probs_bs, old_con_log_probs_bs, old_dis_log_probs_bs = agent_bs.choose_action(state_bs_norm)
 
                 next_s, total_reward, r_dict, done = env.step({"bs": action_bs}, i_episode)
@@ -224,7 +224,6 @@ if __name__ == "__main__":
                 transition_dict_bs["real_dones"].append(bool(done))
                 
                 s = next_s
-                state_bs_norm = next_state_bs_norm
                 terminal = done
 
             if np.mean(episode_rewards_total) > max_avg_reward:

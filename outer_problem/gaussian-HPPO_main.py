@@ -147,7 +147,7 @@ if __name__ == "__main__":
                 transition_dict_bs["old_cont_log_probs"].append(float(np.asarray(old_con_log_probs_bs).item()))
                 transition_dict_bs["old_disc_log_probs"].append(float(np.asarray(old_dis_log_probs_bs).item()))
                 transition_dict_bs["dones"].append(bool(done))
-                transition_dict_bs["real_dones"].append(False)
+                transition_dict_bs["real_dones"].append(bool(done))
 
                 s = next_s
                 terminal = done

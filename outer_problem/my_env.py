@@ -24,7 +24,7 @@ class MyEnv(gym.Env):
         self.madrl_args = madrl_args
         self.epsilon = 1e-4
         self.t = 0
-        self.target_hold_slots = 4  # 每 4 个时隙分配一次目标
+        self.target_hold_slots = 4  # 每 3 个时隙分配一次目标
         # 固定 CU 的任务量
         self.cus_entertaining_task_size = np.ones(self.base_args.cus_num) * 170e3
         # 生成初始 UAV / CU / 目标位置，并预计算 CU 轨迹和 UAV-目标分配调度
@@ -43,13 +43,12 @@ class MyEnv(gym.Env):
         self.precomputed_nlos_components = self._precompute_nlos_components()
 
         self.precomputed_uav_target_schedule, self.precomputed_uav_target_schedule_distances = self.generate_uav_target_schedule()
-        # 打印初始 UAV 目标匹配
-        # self._print_precomputed_target_schedule(
-        #     schedule=self.precomputed_uav_target_schedule,
-        #     schedule_distances=self.precomputed_uav_target_schedule_distances,
-        #     hold_slots=self.target_hold_slots,
-        #     total_time_slots=self.madrl_args.total_time_slots
-        # )
+        self._print_precomputed_target_schedule(
+            schedule=self.precomputed_uav_target_schedule,
+            schedule_distances=self.precomputed_uav_target_schedule_distances,
+            hold_slots=self.target_hold_slots,
+            total_time_slots=self.madrl_args.total_time_slots
+        )
         self.uavs_targets_matched_matrix = self.build_uav_targets_matched_matrix(
             self.precomputed_uav_target_schedule[self.t]
         )
@@ -232,24 +231,24 @@ class MyEnv(gym.Env):
         color_metric = "\033[38;5;109m"
         color_energy = "\033[38;5;108m"
         color_penalty = "\033[38;5;137m"
-        # print(
-        #     f"=================================================="
-        # )
-        # # ---- Action Details ----
-        # print(f"{color_title} ------------ [Action Details] ------------ {color_reset}")
-        # for i in range(self.base_args.uavs_num):
-        #     print(
-        #         f"  {color_metric}UAV-{i}{color_reset}: "
-        #         f"angle={diff_theta[i]:.4f} rad, "
-        #         f"dist={diff_distance[i]:.4f} m, "
-        #         f"off_duration={off_duration[i]:.4f} s, "
-        #         f"{color_energy}→ CU-{int(discrete_actions[i])}{color_reset}"
-        #     )
-        # for i in range(self.base_args.cus_num):
-        #     print(
-        #         f"  {color_penalty}CU-{i}{color_reset}: "
-        #         f"off_power={cus_off_power[i]:.4f} W"
-        #     )
+        print(
+            f"=================================================="
+        )
+        # ---- Action Details ----
+        print(f"{color_title} ------------ [Action Details] ------------ {color_reset}")
+        for i in range(self.base_args.uavs_num):
+            print(
+                f"  {color_metric}UAV-{i}{color_reset}: "
+                f"angle={diff_theta[i]:.4f} rad, "
+                f"dist={diff_distance[i]:.4f} m, "
+                f"off_duration={off_duration[i]:.4f} s, "
+                f"{color_energy}→ CU-{int(discrete_actions[i])}{color_reset}"
+            )
+        for i in range(self.base_args.cus_num):
+            print(
+                f"  {color_penalty}CU-{i}{color_reset}: "
+                f"off_power={cus_off_power[i]:.4f} W"
+            )
         
         total_reward, reward, energy_opt = self.reward_calculator.reward_compute(
             uavs_2_cus_channels=self.uavs_2_cus_channels,
