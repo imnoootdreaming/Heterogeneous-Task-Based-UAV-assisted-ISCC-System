@@ -282,3 +282,11 @@ if __name__ == "__main__":
     })
     df.to_csv(filename, index=False)
     print(f"HPPO 训练文件已保存至 {filename}")
+
+    pthname = f"{current_time_str}_mhbppo_seed_{base_args.seed}"
+    os.makedirs(pthname, exist_ok=True)
+    actor_path = os.path.join(pthname, f"mhbppo_actor.pth")
+    critic_path = os.path.join(pthname, f"mhbppo_critic.pth")
+    torch.save(agent_bs.actor.state_dict(), actor_path)
+    torch.save(agent_bs.critic.state_dict(), critic_path)
+    print(f"模型权重已保存至: mhbppo_actor.pth, mhbppo_critic.pth")

@@ -76,7 +76,7 @@ def get_all_args():
         setattr(madrl_args, key, value)
     # 20260409 - 更强的 HSAC 修改
     if int(madrl_args.minimal_size) <= 0:
-        madrl_args.minimal_size = int(max(4096, 100 * madrl_args.total_time_slots))
+        madrl_args.minimal_size = int(max(4096, 200 * madrl_args.total_time_slots))
     return base_args, madrl_args
 
 
@@ -234,36 +234,12 @@ if __name__ == "__main__":
     df.to_csv(filename, index=False)
     print(f"HSAC training results saved to {filename}")
 
-    all_agents_rewards = np.array(all_agents_rewards)
-    df_agents = pd.DataFrame(all_agents_rewards, columns=["BS_reward"])
-    df_agents.insert(0, "episode", np.arange(madrl_args.episodes))
-    filename_agents = f"{current_time_str}_HSAC_all_agents_rewards_seed_{base_args.seed}.csv"
-    df_agents.to_csv(filename_agents, index=False)
-    print(f"HSAC BS agent rewards saved to {filename_agents}")
-
-    if best_uav_trajectory is not None:
-        uav_traj_list = []
-        for t in range(best_uav_trajectory.shape[0]):
-            for uav_i in range(base_args.uavs_num):
-                x, y, z = best_uav_trajectory[t, uav_i]
-                uav_traj_list.append([t, uav_i, x, y, z])
-        df_uav = pd.DataFrame(uav_traj_list, columns=["time_slot", "uav_id", "x", "y", "z"])
-        df_uav.to_csv(f"{current_time_str}_SEED{base_args.seed}_hsac_best_uav_trajectory.csv", index=False)
-
-    if cu_trajectory is not None:
-        cu_traj_list = []
-        for t in range(cu_trajectory.shape[0]):
-            for cu_i in range(base_args.cus_num):
-                x, y, z = cu_trajectory[t, cu_i]
-                cu_traj_list.append([t, cu_i, x, y, z])
-        df_cu = pd.DataFrame(cu_traj_list, columns=["time_slot", "cu_id", "x", "y", "z"])
-        df_cu.to_csv(f"{current_time_str}_SEED{base_args.seed}_hsac_cu_trajectory.csv", index=False)
-
-    if target_trajectory is not None:
-        target_traj_list = []
-        for t in range(target_trajectory.shape[0]):
-            for target_i in range(base_args.targets_num):
-                x, y, z = target_trajectory[t, target_i]
-                target_traj_list.append([t, target_i, x, y, z])
-        df_target = pd.DataFrame(target_traj_list, columns=["time_slot", "target_id", "x", "y", "z"])
-        df_target.to_csv(f"{current_time_str}_SEED{base_args.seed}_hsac_target_trajectory.csv", index=False)
+    pthname = f"{current_time_str}_hsac_seed_{base_args.seed}"
+    os.makedirs(pthname, exist_ok=True)
+    actor_path = os.path.join(pthname, "hsac_actor.pth")
+    critic1_path = os.path.join(pthname, "hsac_critic1.pth")
+    critic2_path = os.path.join(pthname, "hsac_critic2.pth")
+    torch.save(agent_bs.actor.state_dict(), actor_path)
+    torch.save(agent_bs.critic1.state_dict(), critic1_path)
+    torch.save(agent_bs.critic2.state_dict(), critic2_path)
+    print(f"模型权重已保存至目录 {pthname}: hsac_actor.pth, hsac_critic1.pth, hsac_critic2.pth")
