@@ -376,9 +376,7 @@ class HPPO:
 
     def lr_decay(self, total_steps):
         lr_a_now = self.actor_optimizer.defaults["lr"] * (1 - total_steps / self.num_episodes)
-        lr_a_now = max(lr_a_now, 1e-6)
         lr_c_now = self.critic_optimizer.defaults["lr"] * (1 - total_steps / self.num_episodes)
-        lr_c_now = max(lr_c_now, 1e-6)
 
         for param_group in self.actor_optimizer.param_groups:
             param_group["lr"] = lr_a_now
