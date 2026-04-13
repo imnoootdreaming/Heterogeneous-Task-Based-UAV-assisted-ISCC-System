@@ -30,29 +30,23 @@ class RunningNorm:
 
 class RunningMeanStd:
     # Dynamically calculate mean and std
-    def __init__(self, shape, epsilon=1e-8):
+    def __init__(self, shape):  # shape:the dimension of input data
         self.n = 0
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.S = np.zeros(shape, dtype=np.float64)   # 实际上是累计二阶中心矩 M2
-        self.std = np.ones(shape, dtype=np.float64)
-        self.epsilon = epsilon
+        self.mean = np.zeros(shape)
+        self.S = np.zeros(shape)
+        self.std = np.sqrt(self.S)
 
     def update(self, x):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.array(x)
         self.n += 1
-
         if self.n == 1:
-            self.mean = x.copy()
-            self.S = np.zeros_like(x, dtype=np.float64)
-            self.std = np.ones_like(x, dtype=np.float64)
-            return
-
-        old_mean = self.mean.copy()
-        self.mean = old_mean + (x - old_mean) / self.n
-        self.S = self.S + (x - old_mean) * (x - self.mean)
-
-        var = self.S / self.n
-        self.std = np.sqrt(np.maximum(var, self.epsilon))
+            self.mean = x
+            self.std = x
+        else:
+            old_mean = self.mean.copy()
+            self.mean = old_mean + (x - old_mean) / self.n
+            self.S = self.S + (x - old_mean) * (x - self.mean)
+            self.std = np.sqrt(self.S / self.n)
 
 
 # Reward Scaling

@@ -318,6 +318,13 @@ class MyEnv(gym.Env):
         print(
             f"=================================================="
         )
+        # 判断任务是否完成
+        success = int(
+            reward_components.get("no_solution_penalty", 0) == 0 and
+            reward_components.get("uav_collision_penalty_sum", 0) == 0 and
+            reward_components.get("uav_exceed_boundary_penalty_sum", 0) == 0 and
+            reward_components.get("bs_alloc_spectrum_penalty", 0) == 0
+        )
         self.t += 1
         self.cur_uavs_pos = next_uavs_pos
         self.cur_cus_pos = self.precomputed_cus_traj[self.t].copy()
@@ -328,7 +335,7 @@ class MyEnv(gym.Env):
 
         next_state_dict = {"bs": self._build_bs_observation()}
         done = int(self.t >= self.madrl_args.total_time_slots)
-        return next_state_dict, float(total_reward), reward, done
+        return next_state_dict, float(total_reward), reward, done, energy_opt, success
 
     def reset(self):
         self.t = 0

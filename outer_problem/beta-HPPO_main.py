@@ -165,6 +165,8 @@ if __name__ == "__main__":
     reward_scaler_bs = RewardScaling(shape=1, gamma=madrl_args.gamma)
 
     reward_res = []
+    completion_rate_res = []
+    obj_fun_res = []
     all_agents_rewards = []
     max_avg_reward = -np.inf
     best_uav_trajectory = None
@@ -174,6 +176,8 @@ if __name__ == "__main__":
     with tqdm(total=int(madrl_args.episodes), desc="Training Progress") as pbar:
         for i_episode in range(int(madrl_args.episodes)):
             episode_rewards_total = []
+            obj_fun_total = []
+            success_slots = 0  # 用于统计本 episode 内成功时隙数
             episode_reward_bs = 0.0
 
             transition_dict_bs = {
@@ -203,12 +207,14 @@ if __name__ == "__main__":
 
                 action_bs, old_log_probs_bs, old_con_log_probs_bs, old_dis_log_probs_bs = agent_bs.choose_action(state_bs_norm)
 
-                next_s, total_reward, r_dict, done = env.step({"bs": action_bs}, i_episode)
-
+                next_s, total_reward, r_dict, done, obj_fun, success_flag = env.step({"bs": action_bs}, i_episode)
+                success_slots += success_flag
+                
                 r_bs = float(r_dict["bs"])
                 r_bs_norm = float(np.asarray(reward_scaler_bs(r_bs)).item())
 
                 episode_rewards_total.append(float(total_reward))
+                obj_fun_total.append(float(obj_fun))
                 episode_reward_bs += r_bs
 
                 next_state_bs_norm = running_norm_bs(np.array(next_s["bs"], dtype=np.float32))
@@ -238,12 +244,19 @@ if __name__ == "__main__":
             agent_bs.update(transition_dict_bs, i_episode, writer, agent_name="BS")
 
             avg_total_reward = np.mean(episode_rewards_total)
+            avg_obj_fun = np.mean(obj_fun_total)
             avg_bs_reward = episode_reward_bs / len(episode_rewards_total)
+            completion_rate = (success_slots / madrl_args.total_time_slots) * 100.0
 
             reward_res.append(avg_total_reward)
+            obj_fun_res.append(avg_obj_fun)
             all_agents_rewards.append([avg_bs_reward])
+            completion_rate_res.append(completion_rate)  # 新增列表存储完成率
 
             writer.add_scalar("Reward/episode", avg_total_reward, i_episode)
+            writer.add_scalar("Obj/episode", avg_obj_fun, i_episode)
+            writer.add_scalar("Completion Rate/episode", completion_rate, i_episode)
+
 
             pbar.set_postfix({"avg_reward": f"{avg_total_reward:.3f}"})
             pbar.update(1)
@@ -251,6 +264,8 @@ if __name__ == "__main__":
     writer.close()
 
     reward_array = np.array(reward_res)
+    obj_fun_array = np.array(obj_fun_res)
+    completion_rate_array = np.array(completion_rate_res)
     episodes_list = np.arange(reward_array.shape[0])
     plt.plot(episodes_list, reward_array)
     plt.xlabel("Episodes")
@@ -261,44 +276,9 @@ if __name__ == "__main__":
     filename = f"{current_time_str}_HPPO_training_rewards_seed_{base_args.seed}.csv"
     df = pd.DataFrame({
         "episode": episodes_list,
-        "reward": reward_array
+        "reward": reward_array,
+        "obj" : obj_fun_array,
+        "completion_rate" : completion_rate_array
     })
     df.to_csv(filename, index=False)
     print(f"HPPO 训练文件已保存至 {filename}")
-
-    all_agents_rewards = np.array(all_agents_rewards)
-    df_agents = pd.DataFrame(all_agents_rewards, columns=["BS_reward"])
-    df_agents.insert(0, "episode", np.arange(madrl_args.episodes))
-    filename_agents = f"{current_time_str}_HPPO_all_agents_rewards_seed_{base_args.seed}.csv"
-    df_agents.to_csv(filename_agents, index=False)
-    print(f"HPPO BS Agent 训练奖励已保存至 {filename_agents}")
-
-    if best_uav_trajectory is not None:
-        uav_traj_list = []
-        for t in range(best_uav_trajectory.shape[0]):
-            for uav_i in range(base_args.uavs_num):
-                x, y, z = best_uav_trajectory[t, uav_i]
-                uav_traj_list.append([t, uav_i, x, y, z])
-        df_uav = pd.DataFrame(uav_traj_list, columns=["time_slot", "uav_id", "x", "y", "z"])
-        df_uav.to_csv(f"{current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv", index=False)
-        print(f"HPPO 最佳UAV轨迹已保存至 {current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv")
-
-    if cu_trajectory is not None:
-        cu_traj_list = []
-        for t in range(cu_trajectory.shape[0]):
-            for cu_i in range(base_args.cus_num):
-                x, y, z = cu_trajectory[t, cu_i]
-                cu_traj_list.append([t, cu_i, x, y, z])
-        df_cu = pd.DataFrame(cu_traj_list, columns=["time_slot", "cu_id", "x", "y", "z"])
-        df_cu.to_csv(f"{current_time_str}_SEED{base_args.seed}_cu_trajectory.csv", index=False)
-        print(f"HPPO CU轨迹已保存至 {current_time_str}_SEED{base_args.seed}_cu_trajectory.csv")
-
-    if target_trajectory is not None:
-        target_traj_list = []
-        for t in range(target_trajectory.shape[0]):
-            for target_i in range(base_args.targets_num):
-                x, y, z = target_trajectory[t, target_i]
-                target_traj_list.append([t, target_i, x, y, z])
-        df_target = pd.DataFrame(target_traj_list, columns=["time_slot", "target_id", "x", "y", "z"])
-        df_target.to_csv(f"{current_time_str}_SEED{base_args.seed}_target_trajectory.csv", index=False)
-        print(f"HPPO TARGET轨迹已保存至 {current_time_str}_SEED{base_args.seed}_target_trajectory.csv")
