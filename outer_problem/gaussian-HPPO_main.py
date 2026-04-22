@@ -199,32 +199,10 @@ if __name__ == "__main__":
     df_agents.to_csv(filename_agents, index=False)
     print(f"HPPO BS Agent 训练奖励已保存至 {filename_agents}")
 
-    if best_uav_trajectory is not None:
-        uav_traj_list = []
-        for t in range(best_uav_trajectory.shape[0]):
-            for uav_i in range(base_args.uavs_num):
-                x, y, z = best_uav_trajectory[t, uav_i]
-                uav_traj_list.append([t, uav_i, x, y, z])
-        df_uav = pd.DataFrame(uav_traj_list, columns=["time_slot", "uav_id", "x", "y", "z"])
-        df_uav.to_csv(f"{current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv", index=False)
-        print(f"HPPO 最优UAV轨迹已保存至 {current_time_str}_SEED{base_args.seed}_best_uav_trajectory.csv")
-
-    if cu_trajectory is not None:
-        cu_traj_list = []
-        for t in range(cu_trajectory.shape[0]):
-            for cu_i in range(base_args.cus_num):
-                x, y, z = cu_trajectory[t, cu_i]
-                cu_traj_list.append([t, cu_i, x, y, z])
-        df_cu = pd.DataFrame(cu_traj_list, columns=["time_slot", "cu_id", "x", "y", "z"])
-        df_cu.to_csv(f"{current_time_str}_SEED{base_args.seed}_cu_trajectory.csv", index=False)
-        print(f"HPPO CU轨迹已保存至 {current_time_str}_SEED{base_args.seed}_cu_trajectory.csv")
-
-    if target_trajectory is not None:
-        target_traj_list = []
-        for t in range(target_trajectory.shape[0]):
-            for target_i in range(base_args.targets_num):
-                x, y, z = target_trajectory[t, target_i]
-                target_traj_list.append([t, target_i, x, y, z])
-        df_target = pd.DataFrame(target_traj_list, columns=["time_slot", "target_id", "x", "y", "z"])
-        df_target.to_csv(f"{current_time_str}_SEED{base_args.seed}_target_trajectory.csv", index=False)
-        print(f"HPPO TARGET轨迹已保存至 {current_time_str}_SEED{base_args.seed}_target_trajectory.csv")
+    pthname = f"{current_time_str}_mhgppo_seed_{base_args.seed}"
+    os.makedirs(pthname, exist_ok=True)
+    actor_path = os.path.join(pthname, f"mhgppo_actor.pth")
+    critic_path = os.path.join(pthname, f"mhgppo_critic.pth")
+    torch.save(agent_bs.actor.state_dict(), actor_path)
+    torch.save(agent_bs.critic.state_dict(), critic_path)
+    print(f"模型权重已保存至: mhgppo_actor.pth, mhgppo_critic.pth")
